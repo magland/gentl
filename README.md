@@ -4,11 +4,11 @@ A readability test for codebases. A memoryless agent carries out a realistic tas
 
 gentl is an evaluation tool, not a coding agent; the code the agent writes is a by-product. There are two outputs: the reading effort (a number, mostly useful as a trend over doc changes) and a friction report from an evaluator (what was missing or wrong in the docs, and where the agent guessed).
 
-Status: early. Only host mode is implemented, and you confirm each action before it runs.
+Status: early; the hub, uploads and repeated runs are not implemented yet.
 
 ## Install
 
-Requires Node >= 20.
+Requires Node >= 20 and Docker (or use `--host`).
 
 ```
 git clone https://github.com/magland/gentl
@@ -22,26 +22,44 @@ Set `OPENROUTER_API_KEY` in the environment or in a `.env` file in the directory
 ## Usage
 
 ```
-gentl run TASK.md --host
-gentl run -t "Clone https://github.com/owner/foo, install it and run its tests." --host
+gentl run TASK.md
+gentl run -t "Clone https://github.com/owner/foo, install it and run its tests."
+gentl run tasks/            # a suite: every *.md in the directory
 ```
 
 A task is plain text. It names the repos to clone and, where it matters, the tag or commit; the agent does the cloning itself.
 
 Options:
 
-- `--host`: run on this machine in a fresh temp directory. Required for now; a Docker sandbox will become the default.
+- `--image IMG`: the Docker image for the sandbox. The default is built on first use from [sandbox/Dockerfile](sandbox/Dockerfile) and tagged by its content (`gentl-sandbox:<hash>`).
+- `--host`: run on this machine in a fresh temp directory instead of Docker, for software that can't run in a container (for example a licensed MATLAB).
+- `--confirm`: ask before each action. This is the default with `--host`; Docker runs are unattended unless you pass it.
+- `--yes`: with `--host`, run actions without asking.
 - `--model M`: the agent's model, default `anthropic/claude-haiku-5.5`.
 - `--evaluator-model M`: the evaluator's model, same default.
 - `--base-url URL`: any OpenAI-compatible endpoint (default `https://openrouter.ai/api/v1`). The key in `OPENROUTER_API_KEY` is sent to it.
 - `--max-turns N`: default 50.
-- `--keep`: keep the temp workspace instead of deleting it.
+- `--keep`: keep the container or temp workspace instead of deleting it.
+
+### Docker (default)
+
+Each run gets a fresh container (`docker run --init`, working directory `/work`, network enabled), removed at the end. The default image is Debian (trixie) with Python 3.13, Node, build tools, git, curl and w3m; pip works as root without a virtual environment. The agent's commands run with `docker exec` under `setsid`, so a timeout or Ctrl-C kills the whole command inside the container. A custom image needs bash and `setsid` (util-linux), and git for most tasks. No environment variables from your machine are passed into the container.
+
+The image and its id are recorded in `summary.json`.
 
 ### Host mode
 
 The agent works in `work/` inside a fresh temp directory, with `HOME` set to a sibling `home/` so it does not see your git config, caches or credentials. Only a few environment variables are passed through (`PATH`, locale, proxies); API keys and tokens are not. Each command runs in a fresh bash shell in its own process group, with no input and a 300 s timeout. The workspace is deleted at the end unless `--keep` is given.
 
-The agent can still reach anything on your machine that you can, so gentl shows each action and asks `ok? [y/n]` before running it. On `n` you can give a reason, which is passed back to the agent. Ctrl-C while a command runs stops that command (the agent is told); Ctrl-C at any other time ends the run, and the run directory is still written.
+The agent can still reach anything on your machine that you can, so by default gentl shows each action and asks `ok? [y/n]` before running it. On `n` you can give a reason, which is passed back to the agent. Ctrl-C while a command runs stops that command (the agent is told); Ctrl-C at any other time ends the run, and the run directory is still written. This applies to Docker runs too.
+
+Host mode also inherits whatever is installed on your machine (compilers, Python packages, uv), so setup steps can succeed without the docs being followed, and reading effort is not comparable with Docker runs.
+
+### Suites
+
+`gentl run DIR` runs every `*.md` file in the directory, in name order, skipping `README.md` and files starting with `_`. The task name is the file name. Runs go to `runs/<timestamp>-<suite>/<run>/`, and at the end gentl prints a results table (verdict, self-report, turns, read tokens, notes max, questions, cost) and writes it to `results.md` and `suite.json` in the suite directory. Ctrl-C that ends a run skips the remaining tasks.
+
+Each suite should include a baseline task ("clone, install, run the tests"). Its reading effort is the repo's onboarding cost; read other tasks against it rather than subtracting it.
 
 ## How it works
 

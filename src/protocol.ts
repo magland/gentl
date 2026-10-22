@@ -16,8 +16,8 @@ export const DEFAULT_MAX_CHARS = 2000;
 export const MAX_MAX_CHARS = 20000;
 export const CMD_TIMEOUT_S = 300;
 
-export function systemPrompt(workdir: string): string {
-  return `You are a newcomer to some software, carrying out a task on a ${process.platform} machine with internet access. Your working directory is ${workdir}; it starts empty. Tools include git, curl and w3m (\`w3m -dump URL\` renders a web page as plain text).
+export function systemPrompt(workdir: string, platform: string): string {
+  return `You are a newcomer to some software, carrying out a task on a ${platform} machine with internet access. Your working directory is ${workdir}; it starts empty. Tools include git, curl and w3m (\`w3m -dump URL\` renders a web page as plain text).
 
 Treat the software as unfamiliar. Go by its docs and code, not by what you remember about it, since the version here may differ.
 

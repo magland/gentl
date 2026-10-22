@@ -1,14 +1,8 @@
-// Host-mode workspace: a fresh temp directory with work/ (where the agent's commands run) and home/ (HOME).
+// Where the agent's actions run. A sandbox runs commands with a timeout in their own process group, writes and
+// edits files, and runs short commands for gentl itself (e.g. to record the final state).
 
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { CMD_TIMEOUT_S, countOccurrences, DEFAULT_MAX_CHARS, MAX_MAX_CHARS } from "./protocol.js";
-
-// Environment variables passed through from the user's environment; everything else (API keys, tokens, XDG dirs) is dropped.
-const PASSTHROUGH_ENV = ["PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "USER", "LOGNAME", "SHELL",
-  "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"];
 
 const CAPTURE_HEAD = 1 << 20; // bytes of output kept from the start of a command
 const CAPTURE_TAIL = 1 << 20; // and from the end
@@ -22,6 +16,11 @@ export interface RunResult {
   seconds: number;
   timedOut: boolean;
   interrupted: boolean;
+}
+
+export interface ExecResult {
+  ok: boolean;
+  out: string; // stdout, plus stderr on failure
 }
 
 /** Keep the head and tail, with a note on what was cut and how to see more. */
@@ -63,42 +62,44 @@ class Capture {
   }
 }
 
-export class HostWorkspace {
-  readonly root: string;
-  readonly workdir: string;
-  readonly home: string;
-  readonly env: NodeJS.ProcessEnv;
-  private current: { child: ChildProcess; interrupted: boolean } | null = null;
-  private groups = new Set<number>(); // process groups of all commands, killed on remove()
+/** A started command: the local child process (bash, or the docker client) and how to kill its process group. */
+export interface Started {
+  child: ChildProcess;
+  kill: () => void;
+  ignoreStderr?: boolean; // the command's stderr already arrives on stdout
+}
 
-  constructor() {
-    this.root = fs.mkdtempSync(path.join(os.tmpdir(), "gentl-"));
-    this.workdir = path.join(this.root, "work");
-    this.home = path.join(this.root, "home");
-    fs.mkdirSync(this.workdir);
-    fs.mkdirSync(this.home);
-    this.env = {};
-    for (const k of PASSTHROUGH_ENV) if (process.env[k] !== undefined) this.env[k] = process.env[k];
-    Object.assign(this.env, { HOME: this.home, TERM: "dumb", NO_COLOR: "1", PAGER: "cat", GIT_PAGER: "cat",
-      GIT_TERMINAL_PROMPT: "0" });
-  }
+export abstract class Sandbox {
+  abstract readonly kind: "host" | "docker";
+  /** The working directory as the agent sees it. */
+  abstract readonly workdir: string;
+  private current: { started: Started; interrupted: boolean } | null = null;
 
-  /** Run a command with bash in its own process group, with no input and a timeout. */
+  /** Start `cmd` with bash in the working directory, in its own process group, with no input. */
+  protected abstract start(cmd: string): Started;
+  /** Run a program (argv, no shell) in the sandbox for gentl's own use; `cwd` defaults to the working directory. */
+  abstract exec(args: string[], cwd?: string, input?: string): ExecResult;
+  /** Stop everything and delete the sandbox. */
+  abstract remove(): void;
+  /** One line for the console: where the sandbox is. */
+  abstract describe(): string;
+
   run(cmd: string, maxChars = DEFAULT_MAX_CHARS): Promise<RunResult> {
     maxChars = Math.max(200, Math.min(MAX_MAX_CHARS, Math.floor(maxChars)));
     const t0 = Date.now();
-    const child = spawn("bash", ["-c", cmd], { cwd: this.workdir, env: this.env, detached: true,
-      stdio: ["ignore", "pipe", "pipe"] });
-    const cur = { child, interrupted: false };
+    const started = this.start(cmd);
+    const { child } = started;
+    const cur = { started, interrupted: false };
     this.current = cur;
-    if (child.pid) this.groups.add(child.pid);
     const cap = new Capture();
     child.stdout!.on("data", (b: Buffer) => cap.add(b));
-    child.stderr!.on("data", (b: Buffer) => cap.add(b));
+    child.stderr!.on("data", (b: Buffer) => {
+      if (!started.ignoreStderr) cap.add(b);
+    });
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      this.killGroup(child.pid);
+      started.kill();
     }, CMD_TIMEOUT_S * 1000);
 
     return new Promise((resolve) => {
@@ -121,7 +122,7 @@ export class HostWorkspace {
         finish(null, "spawn error");
       });
       child.on("close", (code, signal) => finish(code, signal));
-      // A background process (`server &`) can keep the pipes open after bash exits; don't wait for it.
+      // A background process (`server &`) can keep the pipes open after the command exits; don't wait for it.
       child.on("exit", (code, signal) => setTimeout(() => {
         child.stdout!.destroy();
         child.stderr!.destroy();
@@ -134,60 +135,28 @@ export class HostWorkspace {
   interrupt(): boolean {
     if (!this.current) return false;
     this.current.interrupted = true;
-    this.killGroup(this.current.child.pid);
+    this.current.started.kill();
     return true;
   }
 
-  private killGroup(pid: number | undefined) {
-    if (!pid) return;
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      // already gone
-    }
-  }
-
-  private resolve(p: string): string {
-    return path.resolve(this.workdir, p);
-  }
-
   writeFile(p: string, content: string): string {
-    try {
-      const abs = this.resolve(p);
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, content);
-      return `wrote ${p}`;
-    } catch (e) {
-      return `error: ${(e as Error).message}`;
-    }
+    const r = this.exec(["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "sh", p], undefined, content);
+    return r.ok ? `wrote ${p}` : `error: ${r.out.trim()}`;
   }
 
   editFile(p: string, old: string, replacement: string): string {
-    let text: string;
-    try {
-      text = fs.readFileSync(this.resolve(p), "utf8");
-    } catch (e) {
-      return `error: ${(e as Error).message}`;
-    }
-    const n = countOccurrences(text, old);
+    const r = this.exec(["cat", "--", p]);
+    if (!r.ok) return `error: ${r.out.trim()}`;
+    const n = countOccurrences(r.out, old);
     if (n !== 1) return `error: the old text occurs ${n} times in ${p}; it must occur exactly once`;
-    try {
-      fs.writeFileSync(this.resolve(p), text.replace(old, () => replacement));
-    } catch (e) {
-      return `error: ${(e as Error).message}`;
-    }
-    return `edited ${p}`;
+    const w = this.exec(["sh", "-c", 'cat > "$1"', "sh", p], undefined, r.out.replace(old, () => replacement));
+    return w.ok ? `edited ${p}` : `error: ${w.out.trim()}`;
   }
+}
 
-  /** Kill leftover background processes and delete the workspace. */
-  remove() {
-    for (const pid of this.groups) this.killGroup(pid);
-    try {
-      fs.rmSync(this.root, { recursive: true, force: true });
-    } catch {
-      // Some caches (e.g. Go modules) are read-only.
-      spawnSync("chmod", ["-R", "u+w", this.root]);
-      fs.rmSync(this.root, { recursive: true, force: true });
-    }
-  }
+/** spawnSync wrapper returning stdout (plus stderr on failure). */
+export function execLocal(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; input?: string }): ExecResult {
+  const p = spawnSync(cmd, args, { ...opts, encoding: "utf8", maxBuffer: 64 << 20 });
+  if (p.error) return { ok: false, out: p.error.message };
+  return { ok: p.status === 0, out: (p.stdout ?? "") + (p.status === 0 ? "" : p.stderr ?? "") };
 }

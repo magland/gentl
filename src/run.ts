@@ -4,13 +4,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { Interrupted, ModelClient, type ModelConfig } from "./model.js";
-import { evaluateRun } from "./evaluate.js";
+import { evaluateRun, type Evaluation } from "./evaluate.js";
 import { describeFinalState, type RepoState } from "./finalstate.js";
 import { applyNotes, ASK_RESULT, describeAction, parseResponse, RESPONSE_SCHEMA, systemPrompt, validateAction,
   type Action } from "./protocol.js";
 import { fence } from "./format.js";
 import { ntok } from "./tokens.js";
-import { HostWorkspace } from "./workspace.js";
+import { DockerSandbox } from "./docker.js";
+import { HostSandbox } from "./host.js";
+import type { Sandbox } from "./sandbox.js";
 
 export const FORMAT_VERSION = 1;
 
@@ -20,12 +22,15 @@ export interface RunOptions {
   taskSource: { kind: "file"; path: string } | { kind: "text" };
   model: ModelConfig;
   evaluatorModel: ModelConfig;
+  sandbox: { kind: "host" } | { kind: "docker"; image: string };
+  confirm: boolean; // ask before each action
   maxTurns: number;
   keep: boolean;
+  runsDir: string; // where the run directory is created
   version: string;
 }
 
-interface Summary {
+export interface Summary {
   format: number;
   gentl_version: string;
   run_id: string;
@@ -34,7 +39,10 @@ interface Summary {
   task: string;
   model: string;
   base_url: string;
-  sandbox: "host";
+  sandbox: "host" | "docker";
+  image: string | null;
+  image_id: string | null;
+  confirm: boolean;
   structured_output: boolean;
   started: string;
   ended: string;
@@ -168,15 +176,23 @@ function actionLine(a: Action): string {
   }
 }
 
-function timestamp(d: Date): string {
+export function timestamp(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-export async function runTask(opts: RunOptions): Promise<boolean> {
+export interface RunOutcome {
+  runDir: string;
+  summary: Summary;
+}
+
+export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   const started = new Date();
   const runId = `${timestamp(started)}-${opts.taskName}`;
-  const runDir = path.resolve("runs", runId);
+  const sb: Sandbox = opts.sandbox.kind === "docker"
+    ? new DockerSandbox(`gentl-${runId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}`, opts.sandbox.image)
+    : new HostSandbox();
+  const runDir = path.resolve(opts.runsDir, runId);
   fs.mkdirSync(runDir, { recursive: true });
   const events = fs.openSync(path.join(runDir, "events.jsonl"), "w");
   const transcript = fs.openSync(path.join(runDir, "transcript.md"), "w");
@@ -187,13 +203,13 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
     tr(`_${msg}_\n`);
   };
 
-  const ws = new HostWorkspace();
-  const system = systemPrompt(ws.workdir);
+  const system = systemPrompt(sb.workdir, sb.kind === "docker" ? "linux" : process.platform);
   const client = new ModelClient(opts.model, { name: "turn", schema: RESPONSE_SCHEMA }, log);
   const s: Summary = {
     format: FORMAT_VERSION, gentl_version: opts.version, run_id: runId, task_name: opts.taskName,
     task_source: opts.taskSource, task: opts.task, model: opts.model.model, base_url: opts.model.baseUrl,
-    sandbox: "host", structured_output: true, started: started.toISOString(), ended: "", duration_s: 0,
+    sandbox: sb.kind, image: sb instanceof DockerSandbox ? sb.image : null,
+    image_id: sb instanceof DockerSandbox ? sb.imageId : null, confirm: opts.confirm, structured_output: true, started: started.toISOString(), ended: "", duration_s: 0,
     system_prompt: system, overhead_tokens: ntok(system) + ntok(opts.task), turns: 0,
     read_tokens_total: 0, notes_tokens_total: 0, notes_tokens_max: 0, result_tokens_total: 0, result_tokens_max: 0,
     model_output_tokens: 0, provider_prompt_tokens: 0, provider_completion_tokens: 0, cost_usd: 0,
@@ -204,24 +220,24 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
   const source = opts.taskSource.kind === "file" ? opts.taskSource.path : "given on the command line";
 
   console.log(`gentl ${opts.version}  run ${runId}`);
-  console.log(`model ${opts.model.model}  sandbox host (confirm each action)  workspace ${ws.workdir}`);
+  console.log(`model ${opts.model.model}  ${sb.describe()}${opts.confirm ? "  (confirm each action)" : ""}`);
   console.log(`\nturn  +read (cumulative)  notes  action`);
-  tr(`# gentl run ${runId}\n\n- Model: ${opts.model.model}\n- Task: ${source}\n- Sandbox: host (${ws.workdir})\n` +
+  tr(`# gentl run ${runId}\n\n- Model: ${opts.model.model}\n- Task: ${source}\n- Sandbox: ${sb.describe()}\n` +
     `- Started: ${started.toISOString()}\n\n## Task\n\n${opts.task}\n\n## System prompt\n\n${fence(system)}`);
   emit({ type: "start", run_id: runId, task: opts.task, task_source: opts.taskSource, model: opts.model.model,
-    base_url: opts.model.baseUrl, sandbox: "host", workspace: ws.workdir, system_prompt: system });
+    base_url: opts.model.baseUrl, sandbox: sb.kind, sandbox_description: sb.describe(), workdir: sb.workdir, confirm: opts.confirm, system_prompt: system });
 
   // Ctrl-C stops the running command, or cancels the model call and ends the run.
   // SIGTERM and SIGHUP end the run wherever it is; the run directory is still completed.
   let abortModel: AbortController | null = null;
   let stopRequested = false;
   const onSigint = () => {
-    if (ws.interrupt()) return;
+    if (sb.interrupt()) return;
     if (abortModel) abortModel.abort();
   };
   const onTerm = () => {
     stopRequested = true;
-    ws.interrupt();
+    sb.interrupt();
     abortModel?.abort();
     activePrompt?.close();
   };
@@ -313,20 +329,20 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
         s.asks.push({ turn, question: String(a.question) });
         full = shown = ASK_RESULT;
       } else {
-        const reason = await confirm(a, line.replace(/^run: /, ""));
+        const reason = opts.confirm ? await confirm(a, line.replace(/^run: /, "")) : null;
         if (reason !== null) {
           s.declined_actions++;
           full = shown = `The person running gentl declined this action.${reason ? ` Their reason: ${reason}` : ""}`;
           ev.declined = reason;
         } else if (a.type === "run") {
-          const r = await ws.run(String(a.cmd), a.max_chars as number | undefined);
+          const r = await sb.run(String(a.cmd), a.max_chars as number | undefined);
           ({ full, shown } = r);
           Object.assign(ev, { truncation: r.truncation ?? undefined, exit_code: r.exitCode, signal: r.signal, cmd_seconds: r.seconds, timed_out: r.timedOut,
             interrupted: r.interrupted });
         } else if (a.type === "write_file") {
-          full = shown = ws.writeFile(String(a.path), String(a.content));
+          full = shown = sb.writeFile(String(a.path), String(a.content));
         } else {
-          full = shown = ws.editFile(String(a.path), String(a.old), String(a.new));
+          full = shown = sb.editFile(String(a.path), String(a.old), String(a.new));
         }
       }
       shown = [...notices, ...n.feedback, shown].join("\n");
@@ -350,7 +366,7 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
     s.ended = ended.toISOString();
     s.duration_s = (ended.getTime() - started.getTime()) / 1000;
     try {
-      const fin = describeFinalState(ws.workdir, ws.env);
+      const fin = describeFinalState(sb);
       fs.writeFileSync(path.join(runDir, "final-state.md"), fin.text);
       s.final_repos = fin.repos;
     } catch (e) {
@@ -361,19 +377,23 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
     tr(`---\n\n## Summary\n\n${formatSummary(s)}`);
     fs.closeSync(events);
     fs.closeSync(transcript);
-    if (opts.keep) console.log(`\nworkspace kept: ${ws.root}`);
-    else ws.remove();
+    if (!opts.keep) sb.remove();
+    else if (sb instanceof DockerSandbox) console.log(`\ncontainer kept: ${sb.name} (remove with: docker rm -f ${sb.name})`);
+    else if (sb instanceof HostSandbox) console.log(`\nworkspace kept: ${sb.root}`);
   }
   console.log(`\n${formatSummary(s)}`);
   if (s.self_report_summary) console.log(`Agent's summary: ${s.self_report_summary}\n`);
   if (s.self_report_friction) console.log(`Agent's friction report: ${s.self_report_friction}\n`);
-  if (s.stop_reason === "finish" || s.stop_reason === "max_turns") await evaluate(runDir, opts.evaluatorModel);
+  if (s.stop_reason === "finish" || s.stop_reason === "max_turns") {
+    const ev = await evaluate(runDir, opts.evaluatorModel);
+    if (ev) s.evaluation = { model: ev.model, success: ev.success, reasons: ev.reasons, cost_usd: ev.cost_usd };
+  }
   console.log(`Run directory: ${runDir}`);
-  return s.stop_reason !== "error";
+  return { runDir, summary: s };
 }
 
 /** Run the evaluator on a run directory and print its verdict and friction report. Ctrl-C skips it. */
-export async function evaluate(runDir: string, cfg: ModelConfig): Promise<boolean> {
+export async function evaluate(runDir: string, cfg: ModelConfig): Promise<Evaluation | null> {
   console.log(`Evaluating with ${cfg.model} ...`);
   const ac = new AbortController();
   const onSigint = () => ac.abort();
@@ -382,11 +402,11 @@ export async function evaluate(runDir: string, cfg: ModelConfig): Promise<boolea
     const ev = await evaluateRun(runDir, cfg, ac.signal, (msg) => console.log(`     ${msg}`));
     console.log(`\nVerdict: ${ev.success ? "success" : "failure"}\n\n${ev.reasons}\n\nFriction report:\n\n${ev.friction_report}\n`);
     console.log(`Evaluator cost: $${ev.cost_usd.toFixed(4)}; written to friction.md, evaluation.json and summary.json`);
-    return true;
+    return ev;
   } catch (e) {
     const msg = e instanceof Interrupted ? "interrupted" : (e as Error).message;
     console.log(`Evaluation skipped (${msg}). Run it later with: gentl evaluate ${path.relative(process.cwd(), runDir)}`);
-    return false;
+    return null;
   } finally {
     process.off("SIGINT", onSigint);
   }

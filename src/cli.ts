@@ -2,7 +2,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
+import { checkDocker, ensureDefaultImage } from "./docker.js";
 import { evaluate, runTask } from "./run.js";
+import { runSuite } from "./suite.js";
 
 const VERSION: string = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
@@ -12,18 +14,21 @@ const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const USAGE = `gentl ${VERSION}: a readability test for codebases
 
 usage:
-  gentl run (TASK.md | -t TEXT) --host [options]   run the agent on a task, then evaluate the run
-  gentl evaluate RUN_DIR [options]                 (re-)evaluate a finished run
+  gentl run (TASK.md | DIR | -t TEXT) [options]   run the agent on a task, then evaluate the run;
+                                                 DIR runs each *.md in it as a suite
+  gentl evaluate RUN_DIR [options]                (re-)evaluate a finished run
 
 options:
   -t, --task TEXT     task text given directly
-  --host              run in a fresh temp directory on this machine, confirming each action
-                      (required for now; a Docker sandbox comes later)
+  --image IMG         Docker image for the sandbox (default: built from gentl's sandbox/Dockerfile)
+  --host              run in a fresh temp directory on this machine instead of Docker
+  --confirm           ask before each action (the default with --host)
+  --yes               with --host, run actions without asking
   --model M           model for the agent (default ${DEFAULT_MODEL})
   --evaluator-model M model for the evaluator (default ${DEFAULT_MODEL})
   --base-url URL      OpenAI-compatible endpoint (default ${DEFAULT_BASE_URL})
   --max-turns N       stop after N turns (default 50)
-  --keep              keep the temp workspace instead of deleting it
+  --keep              keep the container or temp workspace instead of deleting it
 
 The API key is read from OPENROUTER_API_KEY, in the environment or in ./.env.
 Runs are written to ./runs/<id>/.`;
@@ -51,6 +56,9 @@ async function run(argv: string[]) {
     options: {
       task: { type: "string", short: "t" },
       host: { type: "boolean" },
+      image: { type: "string" },
+      confirm: { type: "boolean" },
+      yes: { type: "boolean" },
       model: { type: "string", default: DEFAULT_MODEL },
       "evaluator-model": { type: "string", default: DEFAULT_MODEL },
       "base-url": { type: "string", default: DEFAULT_BASE_URL },
@@ -64,11 +72,29 @@ async function run(argv: string[]) {
     return;
   }
   if ((values.task === undefined) === (positionals.length !== 1)) fail("give one task: a task file or -t TEXT");
-  if (!values.host) fail("only --host is supported for now (a Docker sandbox comes later); pass --host to run in a temp directory on this machine, confirming each action");
-  if (!process.stdin.isTTY) fail("--host needs a terminal to confirm each action");
+  if (values.host && values.image) fail("--image applies to the Docker sandbox, not --host");
+  if (values.confirm && values.yes) fail("--confirm and --yes contradict each other");
+  const confirm = values.host ? !values.yes : !!values.confirm;
+  if (confirm && !process.stdin.isTTY) fail("confirming each action needs a terminal (use --yes with --host to skip it)");
   const maxTurns = Number(values["max-turns"]);
   if (!Number.isInteger(maxTurns) || maxTurns < 1) fail("--max-turns must be a positive integer");
   const apiKey = requireApiKey();
+
+  let sandbox: { kind: "host" } | { kind: "docker"; image: string };
+  if (values.host) {
+    sandbox = { kind: "host" };
+    if (!confirm) console.log("warning: host mode without confirmation; the agent's commands run on this machine unchecked");
+  } else {
+    try {
+      checkDocker();
+      sandbox = { kind: "docker", image: values.image ?? ensureDefaultImage() };
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  }
+  const common = { sandbox, confirm, maxTurns, keep: !!values.keep, version: VERSION,
+    model: { model: values.model!, baseUrl: values["base-url"]!, apiKey },
+    evaluatorModel: { model: values["evaluator-model"]!, baseUrl: values["base-url"]!, apiKey } };
 
   let task: string;
   let taskName: string;
@@ -81,17 +107,25 @@ async function run(argv: string[]) {
     const p = positionals[0];
     if (/^https?:\/\//.test(p)) fail("hub tasks are not supported yet");
     if (!fs.existsSync(p)) fail(`no such file: ${p}`);
-    if (fs.statSync(p).isDirectory()) fail("task suites (directories) are not supported yet");
+    if (fs.statSync(p).isDirectory()) {
+      try {
+        process.exit((await runSuite(p, common)) ? 0 : 1);
+      } catch (e) {
+        fail((e as Error).message);
+      }
+    }
     task = fs.readFileSync(p, "utf8").trim();
     taskName = path.basename(p).replace(/\.[^.]*$/, "");
     taskSource = { kind: "file", path: p };
   }
   if (!task) fail("the task is empty");
 
-  const ok = await runTask({ task, taskName, taskSource, maxTurns, keep: !!values.keep, version: VERSION,
-    model: { model: values.model!, baseUrl: values["base-url"]!, apiKey },
-    evaluatorModel: { model: values["evaluator-model"]!, baseUrl: values["base-url"]!, apiKey } });
-  process.exit(ok ? 0 : 1);
+  try {
+    const out = await runTask({ ...common, task, taskName, taskSource, runsDir: "runs" });
+    process.exit(out.summary.stop_reason === "error" ? 1 : 0);
+  } catch (e) {
+    fail((e as Error).message);
+  }
 }
 
 function requireApiKey(): string {
