@@ -5,6 +5,7 @@ import * as readline from "node:readline";
 import { parseArgs } from "node:util";
 import { checkDocker, ensureDefaultImage } from "./docker.js";
 import { fetchHubTask, hubCredentials, parseHubTaskUrl, runDirsIn, runHub, uploadRun, type HubCredentials } from "./hub.js";
+import { resolveSharedHome } from "./host.js";
 import { findRepo, prepareLocalCopy, removeLocalCopy, type LocalCopy } from "./localcopy.js";
 import type { ModelConfig } from "./model.js";
 import { evaluate, runTask, type RunOptions } from "./run.js";
@@ -29,6 +30,9 @@ options:
   --image IMG         Docker image for the sandbox (default: built from gentl's sandbox/Dockerfile)
   --host              run in a fresh temp directory on this machine instead of Docker
   --confirm           ask before each action (the default with --host)
+  --share-home PATH   with --host, link this part of your home directory (e.g. .matlab) into the
+                      agent's otherwise empty HOME; repeatable
+  --pass-env NAME     with --host, pass this environment variable through as well; repeatable
   --yes               don't ask: run a hub task without confirming it, and with --host, run actions
                       without asking
   --upload            upload each finished run to the hub its task came from
@@ -75,6 +79,8 @@ async function run(argv: string[]) {
       confirm: { type: "boolean" },
       yes: { type: "boolean" },
       local: { type: "boolean" },
+      "share-home": { type: "string", multiple: true },
+      "pass-env": { type: "string", multiple: true },
       upload: { type: "boolean" },
       remote: { type: "boolean" },
       model: { type: "string", default: DEFAULT_MODEL },
@@ -103,9 +109,19 @@ async function run(argv: string[]) {
   if (!Number.isInteger(repeat) || repeat < 1) fail("--repeat must be a positive integer");
   const modelFor = modelConfig(values.backend, values["base-url"]!);
 
-  let sandbox: { kind: "host" } | { kind: "docker"; image: string };
+  let sandbox: RunOptions["sandbox"];
+  const shareHome = values["share-home"] ?? [];
+  const passEnv = values["pass-env"] ?? [];
+  if (!values.host && (shareHome.length || passEnv.length)) fail("--share-home and --pass-env apply only with --host");
+  for (const p of shareHome) {
+    try {
+      resolveSharedHome(p);
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  }
   if (values.host) {
-    sandbox = { kind: "host" };
+    sandbox = { kind: "host", shareHome, passEnv };
     if (!confirm) console.log("warning: host mode without confirmation; the agent's commands run on this machine unchecked");
   } else {
     try {

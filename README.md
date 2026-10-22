@@ -70,6 +70,12 @@ The agent works in `work/` inside a fresh temp directory, with `HOME` set to a s
 
 The agent can still reach anything on your machine that you can, so by default gentl shows each action and asks `ok? [y/n]` before running it. On `n` you can give a reason, which is passed back to the agent.
 
+Some licensed software keeps its licensing state in your home directory, which the agent's empty HOME does not have. `--share-home PATH` (repeatable) links that part of your real home directory into the agent's HOME, read and write, leaving the rest hidden; `--pass-env NAME` (repeatable) passes one more environment variable through. Both are printed at the start and recorded in `summary.json`. For MATLAB (tested with R2025b and online licensing; without them it fails with licensing error 5201):
+
+```
+gentl run TASK --host --share-home .matlab --share-home .MathWorks --share-home .MATLABConnector
+```
+
 Host mode also inherits whatever is installed on your machine (compilers, Python packages, uv), so setup steps can succeed without the docs being followed, and reading effort is not comparable with Docker runs.
 
 ### Suites

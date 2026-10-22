@@ -27,7 +27,7 @@ export interface RunOptions {
   upload: HubCredentials | null; // upload the run to its task's hub when it ends
   model: ModelConfig;
   evaluatorModel: ModelConfig;
-  sandbox: { kind: "host" } | { kind: "docker"; image: string };
+  sandbox: { kind: "host"; shareHome: string[]; passEnv: string[] } | { kind: "docker"; image: string };
   confirm: boolean; // ask before each action
   localCopy: LocalCopy | null; // serve clones of this repo from the local checkout
   maxTurns: number;
@@ -50,6 +50,8 @@ export interface Summary {
   image: string | null;
   image_id: string | null;
   confirm: boolean;
+  host_share_home: string[];
+  host_pass_env: string[];
   local_copy: ReturnType<typeof localCopyInfo> | null;
   structured_output: boolean;
   started: string;
@@ -211,7 +213,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     // The random suffix keeps names unique when two gentl processes start the same task in the same second.
     ? new DockerSandbox(`gentl-${runId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}-${randomBytes(3).toString("hex")}`, opts.sandbox.image,
       lc ? [{ host: lc.mirrorDir, container: MIRROR_MOUNT }] : [])
-    : new HostSandbox();
+    : new HostSandbox({ shareHome: opts.sandbox.shareHome, passEnv: opts.sandbox.passEnv });
   // Signal handlers go in as soon as the sandbox exists, so no signal can leave it behind.
   // Ctrl-C aborts the run wherever it is (a running command is killed, a model call cancelled); the run is
   // then evaluated as a failure and, with --upload, reported. SIGTERM and SIGHUP end it without either.
@@ -262,6 +264,8 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     base_url: opts.model.backend === "openrouter" ? opts.model.baseUrl : null,
     sandbox: sb.kind, image: sb instanceof DockerSandbox ? sb.image : null,
     image_id: sb instanceof DockerSandbox ? sb.imageId : null, confirm: opts.confirm,
+    host_share_home: opts.sandbox.kind === "host" ? opts.sandbox.shareHome : [],
+    host_pass_env: opts.sandbox.kind === "host" ? opts.sandbox.passEnv : [],
     local_copy: lc && !localCopyError ? localCopyInfo(lc) : null, structured_output: true, started: started.toISOString(), ended: "", duration_s: 0,
     system_prompt: system, overhead_tokens: ntok(system) + ntok(opts.task), turns: 0,
     read_tokens_total: 0, notes_tokens_total: 0, notes_tokens_max: 0, result_tokens_total: 0, result_tokens_max: 0,
