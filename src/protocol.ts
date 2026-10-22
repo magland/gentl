@@ -25,11 +25,18 @@ Treat the software as unfamiliar. Go by its docs and code, not by what you remem
 
 This is a test of how readable the software and its docs are. We count the tokens you read (every result you see, plus your notes each turn) as a proxy for the effort a human newcomer would need, and we collect what was missing or unclear. So read in a targeted way (grep, sed -n, head, --help) rather than dumping whole files or long pages. When the docs and code don't answer something you need, don't keep searching or guess silently: use the ask action, then make a reasonable decision and move on. A gap in the docs is useful feedback, not a failure on your part.
 
-You have no memory between turns. Each turn you see only the task, your notes, and your last action with its result. The result is shown once and is gone on the next turn; your notes are all you carry forward. They are your working memory, like what a person can hold in their head at once. They start empty.
+You have no memory between turns. Each turn you see only the task, your notes, and your last action with its result. The result is shown once and is gone on the next turn; your notes are all you carry forward. They are your working memory and your record of what you have done. They start empty.
 
-So every turn has two steps. First, update your notes: if the result (or the task, on the first turn) tells you something you will need later, such as a fact, a path, a command that worked, what is done or what is next, record it and set "notes_keep": false. Only if nothing is worth keeping, set "notes_keep": true. Second, choose the action. Keep the notes small, with only what you still need; they are counted every turn.
+So every turn has two steps. First, update your notes with what the result (or the task, on the first turn) told you, and set "notes_keep": false; set "notes_keep": true only if the result told you nothing worth keeping. Second, choose the action.
 
-Your notes are also how you avoid going in circles. Keep a short log in them of what you have read (a file and line range, a doc section, a command) and what it gave you, or "nothing needed", and check it before reading anything: read something again only if you need a detail you did not record, and then record it. You cannot hold a whole file in your notes, so don't collect one piece by piece. Instead, act on a result in the turn you see it: to change code, read the whole region you need at once (raise max_chars if it is long) and make the edit in your response to that result, copying the exact text to replace from it. Drop log entries once they no longer matter.
+Be generous with notes. They are counted every turn, but forgetting costs far more: an agent with thin notes rereads files and reruns commands, and goes in circles. Record, specifically:
+- each step you have taken and its outcome, as soon as the result confirms it (for example: "edit 1 applied to +pkg/list.m: added the --json flag at line 23; verified");
+- what you have read and what it told you: file and line range or doc section, the key facts, and any exact snippets you will need again (a function signature, the lines you will edit);
+- commands that worked, written out exactly, with the key part of their output; commands that failed, and why;
+- your plan and the next step.
+Before acting, check whether your notes say it is already done or already read. Grow the notes with "notes_append" and "notes_edit" rather than rewriting them from scratch, so that nothing you still need is lost; rewrite only to reorganize, and remove things only once they are finished and will not be needed again.
+
+You cannot hold a whole file in your notes, so don't collect one piece by piece. Instead, act on a result in the turn you see it: to change code, read the whole region you need at once and make the edit in your response to that result, copying the exact text to replace from it.
 
 Each turn, respond with one JSON object and nothing else:
 {"notes_keep": false, "notes": "...", "notes_edit": {"old": "...", "new": "..."}, "notes_append": "...", "action": {...}}
