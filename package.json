@@ -1,0 +1,27 @@
+{
+  "name": "@magland/gentl",
+  "version": "0.1.0",
+  "description": "A readability test for codebases: a memoryless agent carries out a newcomer task and gentl measures how much it had to read.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "gentl": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc"
+  },
+  "dependencies": {
+    "js-tiktoken": "^1.0.21"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}
