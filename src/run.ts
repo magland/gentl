@@ -132,12 +132,6 @@ function formatSummary(s: Summary): string {
   return rows.map(([k, v]) => `- ${k}: ${v}`).join("\n") + "\n";
 }
 
-function firstLine(s: string, max: number): string {
-  const line = s.split("\n")[0];
-  const cut = line.length > max ? line.slice(0, max) : line;
-  return cut === s ? cut : `${cut} …`;
-}
-
 function indent(text: string, maxLines: number): string {
   const lines = text.replace(/\n$/, "").split("\n");
   const shown = lines.slice(0, maxLines).map((l) => `       ${l}`);
@@ -170,8 +164,8 @@ function ask(question: string): Promise<string> {
 }
 
 /** Show the action and ask for approval. Returns null if approved, else the reason given (possibly empty). */
-async function confirm(a: Action, lineShown: string): Promise<string | null> {
-  if (a.type === "run" && lineShown !== a.cmd) console.log(indent(String(a.cmd), 40));
+async function confirm(a: Action, shownExactly: boolean): Promise<string | null> {
+  if (a.type === "run" && !shownExactly) console.log(`     exactly:\n${indent(String(a.cmd), 40)}`);
   if (a.type === "write_file") console.log(indent(String(a.content), 30));
   if (a.type === "edit_file") console.log(`       old:\n${indent(String(a.old), 15)}\n       new:\n${indent(String(a.new), 15)}`);
   for (;;) {
@@ -181,21 +175,36 @@ async function confirm(a: Action, lineShown: string): Promise<string | null> {
   }
 }
 
-function actionLine(a: Action): string {
+const MAX_CMD_LINES = 9; // lines of a multi-line command shown on the console
+
+/**
+ * The action as shown on the console: its first line goes on the turn line, any further lines below it.
+ * A command's leading "cd <dir> &&" is left out and paths are shown relative to the working directory;
+ * `exact` says whether the command appears exactly as it will run (with --host's confirmation it is
+ * otherwise printed in full before asking).
+ */
+function actionDisplay(a: Action, workdir: string): { lines: string[]; exact: boolean } {
+  const rel = (p: unknown) => (String(p).startsWith(workdir + "/") ? String(p).slice(workdir.length + 1) : String(p));
   switch (a.type) {
-    case "run":
-      return `run: ${firstLine(String(a.cmd), 90)}`;
+    case "run": {
+      const cmd = String(a.cmd);
+      const shown = cmd.replace(/^cd\s+\S+\s*(&&|;)\s*/, "");
+      const all = shown.replace(/\n+$/, "").split("\n");
+      const lines = all.slice(0, MAX_CMD_LINES).map((l, i) => (i === 0 ? `run: ${l}` : l));
+      if (all.length > MAX_CMD_LINES) lines.push(`(${all.length - MAX_CMD_LINES} more lines)`);
+      return { lines, exact: shown === cmd && all.length <= MAX_CMD_LINES };
+    }
     case "read_file":
-      return `read_file: ${a.path}${a.start_line !== undefined || a.end_line !== undefined ? ` ${a.start_line ?? 1}-${a.end_line ?? "end"}` : ""}`;
+      return { lines: [`read_file: ${rel(a.path)}${a.start_line !== undefined || a.end_line !== undefined ? ` ${a.start_line ?? 1}-${a.end_line ?? "end"}` : ""}`], exact: true };
     case "write_file":
     case "edit_file":
-      return `${a.type}: ${a.path}`;
+      return { lines: [`${a.type}: ${rel(a.path)}`], exact: true };
     case "ask":
-      return `ask: ${firstLine(String(a.question), 90)}`;
+      return { lines: String(a.question).split("\n").map((l, i) => (i === 0 ? `ask: ${l}` : l)), exact: true };
     case "finish":
-      return `finish: ${a.success ? "success" : "failure"}`;
+      return { lines: [`finish: ${a.success ? "success" : "failure"}`], exact: true };
     default:
-      return firstLine(JSON.stringify(a), 90);
+      return { lines: [JSON.stringify(a)], exact: true };
   }
 }
 
@@ -391,8 +400,9 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
         n.feedback.push(`note: your notes went from ${notesBefore} to ${notesAfter} tokens with this rewrite; check that nothing you still need was lost (grow the notes with notes_append and notes_edit rather than rewriting them).`);
       }
       const a = parsed.action;
-      const line = actionLine(a);
-      console.log(prefix + line);
+      const display = actionDisplay(a, sb.workdir);
+      console.log(prefix + display.lines[0]);
+      for (const l of display.lines.slice(1)) console.log(" ".repeat(prefix.length) + l);
       tr(`### Notes (${n.ops.length ? n.ops.join(", ") : parsed.notes_keep === true ? "kept" : "unchanged"}; ${ntok(notes)} tokens)\n\n${fence(notes || "(empty)")}`);
       for (const f of n.feedback) tr(`_${f}_\n`);
       tr(formatAction(a));
@@ -429,7 +439,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
         s.asks.push({ turn, question: String(a.question) });
         full = shown = ASK_RESULT;
       } else {
-        const reason = opts.confirm ? await confirm(a, line.replace(/^run: /, "")) : null;
+        const reason = opts.confirm ? await confirm(a, display.exact) : null;
         if (reason !== null) {
           s.declined_actions++;
           full = shown = `The person running gentl declined this action.${reason ? ` Their reason: ${reason}` : ""}`;
