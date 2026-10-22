@@ -74,6 +74,13 @@ export function prepareLocalCopy(repo: string, origin: string): LocalCopy {
   const branch = branchRef.ok ? branchRef.out.trim().replace(/^refs\/heads\//, "") : null;
   const head = git(["rev-parse", "HEAD"], { cwd: repo }).out.trim();
 
+  // Honor the checkout's own excludes (.git/info/exclude), which git would not read with GIT_DIR set to the mirror.
+  const exclude = git(["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], { cwd: repo }).out.trim();
+  if (exclude && fs.existsSync(exclude)) {
+    fs.mkdirSync(path.join(mirror, "info"), { recursive: true });
+    fs.copyFileSync(exclude, path.join(mirror, "info", "exclude"));
+  }
+
   // Build a tree of the working copy with a temporary index, writing objects into the mirror only.
   const index = path.join(mirrorDir, "index");
   const env = { GIT_DIR: mirror, GIT_WORK_TREE: repo, GIT_INDEX_FILE: index };

@@ -6,7 +6,7 @@ import { checkDocker, ensureDefaultImage } from "./docker.js";
 import { findRepo, prepareLocalCopy, removeLocalCopy, type LocalCopy } from "./localcopy.js";
 import type { ModelConfig } from "./model.js";
 import { evaluate, runTask } from "./run.js";
-import { runSuite } from "./suite.js";
+import { runBatch, suiteTasks } from "./suite.js";
 
 const VERSION: string = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
@@ -33,6 +33,7 @@ options:
                       GENTL_BACKEND, else openrouter
   --base-url URL      OpenAI-compatible endpoint (default ${DEFAULT_BASE_URL})
   --max-turns N       stop after N turns (default 50)
+  --repeat N          run each task N times and report the success rate and median read tokens
   --local             serve clones of the task's repo from your checkout, uncommitted changes included
                       (the default when the task file, suite or current directory is in a git repo)
   --remote            clone the published repo instead
@@ -74,6 +75,7 @@ async function run(argv: string[]) {
       backend: { type: "string" },
       "base-url": { type: "string", default: DEFAULT_BASE_URL },
       "max-turns": { type: "string", default: "50" },
+      repeat: { type: "string", default: "1" },
       keep: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
@@ -90,6 +92,8 @@ async function run(argv: string[]) {
   if (confirm && !process.stdin.isTTY) fail("confirming each action needs a terminal (use --yes with --host to skip it)");
   const maxTurns = Number(values["max-turns"]);
   if (!Number.isInteger(maxTurns) || maxTurns < 1) fail("--max-turns must be a positive integer");
+  const repeat = Number(values.repeat);
+  if (!Number.isInteger(repeat) || repeat < 1) fail("--repeat must be a positive integer");
   const modelFor = modelConfig(values.backend, values["base-url"]!);
 
   let sandbox: { kind: "host" } | { kind: "docker"; image: string };
@@ -141,8 +145,11 @@ async function run(argv: string[]) {
     model: modelFor(values.model!), evaluatorModel: modelFor(values["evaluator-model"]!) };
   let code = 0;
   try {
-    if (target.kind === "suite") code = (await runSuite(target.dir, common)) ? 0 : 1;
-    else {
+    if (target.kind === "suite") {
+      code = (await runBatch(path.basename(path.resolve(target.dir)), suiteTasks(target.dir), repeat, common)) ? 0 : 1;
+    } else if (repeat > 1) {
+      code = (await runBatch(`${target.taskName}-x${repeat}`, [target], repeat, common)) ? 0 : 1;
+    } else {
       const out = await runTask({ ...common, task: target.task, taskName: target.taskName, taskSource: target.taskSource, runsDir: "runs" });
       code = out.summary.stop_reason === "error" ? 1 : 0;
     }

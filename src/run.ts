@@ -1,5 +1,6 @@
 // The agent loop: one model call per turn, one action per turn, everything recorded in ./runs/<id>/.
 
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -198,7 +199,8 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   const lc = opts.localCopy;
   const MIRROR_MOUNT = "/srv/git";
   const sb: Sandbox = opts.sandbox.kind === "docker"
-    ? new DockerSandbox(`gentl-${runId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}`, opts.sandbox.image,
+    // The random suffix keeps names unique when two gentl processes start the same task in the same second.
+    ? new DockerSandbox(`gentl-${runId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}-${randomBytes(3).toString("hex")}`, opts.sandbox.image,
       lc ? [{ host: lc.mirrorDir, container: MIRROR_MOUNT }] : [])
     : new HostSandbox();
   const localCopyError = lc

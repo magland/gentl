@@ -38,8 +38,15 @@ export class ClaudeCodeClient implements ModelClient {
 
   async call(system: string, user: string, signal: AbortSignal): Promise<ModelReply> {
     for (let attempt = 0; ; attempt++) {
-      const r = await this.once(system, user, signal);
+      const r = await this.once(system, user, signal, this.structured);
       if (r.ok) return r.reply;
+      // Claude Code gave up producing output that matches the schema. Retrying the same call tends to give a
+      // degenerate answer, so retry this one call as plain text (the parser finds the JSON object).
+      if (this.structured && /structured_output/i.test(r.error)) {
+        this.log(`structured output failed for this call (${r.error}); retrying it as plain text`);
+        const plain = await this.once(system, user, signal, false);
+        if (plain.ok) return plain.reply;
+      }
       if (/not logged in|\/login/i.test(r.error)) throw new Error(`claude: ${r.error} (log in to Claude Code first)`);
       if (this.structured && /schema/i.test(r.error)) {
         this.structured = false;
@@ -52,13 +59,13 @@ export class ClaudeCodeClient implements ModelClient {
     }
   }
 
-  private once(system: string, user: string, signal: AbortSignal):
+  private once(system: string, user: string, signal: AbortSignal, structured: boolean):
     Promise<{ ok: true; reply: ModelReply } | { ok: false; error: string }> {
     const args = ["-p", "--system-prompt", system, "--tools", "", "--output-format", "json", "--no-session-persistence",
       "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "--model", this.model];
     // Claude Code's default effort unless GENTL_CLAUDE_EFFORT is set (low, medium, high, ...).
     if (process.env.GENTL_CLAUDE_EFFORT) args.push("--effort", process.env.GENTL_CLAUDE_EFFORT);
-    if (this.structured) args.push("--json-schema", JSON.stringify(this.schema.schema));
+    if (structured) args.push("--json-schema", JSON.stringify(this.schema.schema));
     const cwd = this.cwd && fs.existsSync(this.cwd) ? this.cwd : emptyDir();
     return new Promise((resolve, reject) => {
       const child = spawn("claude", args, { cwd, detached: true, stdio: ["pipe", "pipe", "pipe"] });

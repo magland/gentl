@@ -41,6 +41,7 @@ Options:
 - `--local` / `--remote`: serve clones of the task's repo from your checkout (the default inside a git repo), or clone the published repo; see Local copy.
 - `--base-url URL`: any OpenAI-compatible endpoint (default `https://openrouter.ai/api/v1`). The key in `OPENROUTER_API_KEY` is sent to it.
 - `--max-turns N`: default 50.
+- `--repeat N`: run each task N times; see Repeated runs.
 - `--keep`: keep the container or temp workspace instead of deleting it.
 
 ### Local copy
@@ -71,7 +72,11 @@ Host mode also inherits whatever is installed on your machine (compilers, Python
 
 ### Suites
 
-`gentl run DIR` runs every `*.md` file in the directory, in name order, skipping `README.md` and files starting with `_`. The task name is the file name. Runs go to `runs/<timestamp>-<suite>/<run>/`, and at the end gentl prints a results table (verdict, self-report, turns, read tokens, notes max, questions, cost) and writes it to `results.md` and `suite.json` in the suite directory. Ctrl-C that ends a run skips the remaining tasks.
+`gentl run DIR` runs every `*.md` file in the directory, in name order, skipping `README.md` and files starting with `_`. The task name is the file name. Runs go to `runs/<timestamp>-<suite>/<run>/`, and at the end gentl prints a results table (verdict, self-report, turns, read tokens, notes max, questions, cost) and writes it to `results.md` and `results.json` in the suite directory. Ctrl-C that ends a run skips the remaining runs.
+
+### Repeated runs
+
+Reading effort varies a lot from run to run, since the agent may take a different route each time, so a single run says little. `--repeat N` runs each task N times, one after another, into `runs/<timestamp>-<task>-xN/` (or the suite directory). Besides the per-run table, it reports per task the success rate (runs the evaluator judged successful) and the median, interquartile range and range of read tokens, the median turns and the median notes max, all over the successful runs only.
 
 Each suite should include a baseline task ("clone, install, run the tests"). Its reading effort is the repo's onboarding cost; read other tasks against it rather than subtracting it.
 
