@@ -37,7 +37,7 @@ Options:
 - `--yes`: with `--host`, run actions without asking.
 - `--model M`: the agent's model, default `anthropic/claude-haiku-5.5`.
 - `--evaluator-model M`: the evaluator's model, same default.
-- `--upload`: upload each finished run to the hub its task came from.
+- `--upload`: upload each run that finishes, reaches the turn limit or is aborted to the hub its task came from.
 - `--yes`: don't ask before running a hub task (and, with `--host`, before each action).
 - `--backend B`: `openrouter` (default) or `claude-code`; see Backends.
 - `--local` / `--remote`: serve clones of the task's repo from your checkout (the default inside a git repo), or clone the published repo; see Local copy.
@@ -68,13 +68,13 @@ The image and its id are recorded in `summary.json`.
 
 The agent works in `work/` inside a fresh temp directory, with `HOME` set to a sibling `home/` so it does not see your git config, caches or credentials. Only a few environment variables are passed through (`PATH`, locale, proxies); API keys and tokens are not. Each command runs in a fresh bash shell in its own process group, with no input and a 300 s timeout. The workspace is deleted at the end unless `--keep` is given.
 
-The agent can still reach anything on your machine that you can, so by default gentl shows each action and asks `ok? [y/n]` before running it. On `n` you can give a reason, which is passed back to the agent. Ctrl-C while a command runs stops that command (the agent is told); Ctrl-C at any other time ends the run, and the run directory is still written. This applies to Docker runs too.
+The agent can still reach anything on your machine that you can, so by default gentl shows each action and asks `ok? [y/n]` before running it. On `n` you can give a reason, which is passed back to the agent.
 
 Host mode also inherits whatever is installed on your machine (compilers, Python packages, uv), so setup steps can succeed without the docs being followed, and reading effort is not comparable with Docker runs.
 
 ### Suites
 
-`gentl run DIR` runs every `*.md` file in the directory, in name order, skipping `README.md` and files starting with `_`. The task name is the file name. Runs go to `runs/<timestamp>-<suite>/<run>/`, and at the end gentl prints a results table (verdict, self-report, turns, read tokens, notes max, questions, cost) and writes it to `results.md` and `results.json` in the suite directory. Ctrl-C that ends a run skips the remaining runs.
+`gentl run DIR` runs every `*.md` file in the directory, in name order, skipping `README.md` and files starting with `_`. The task name is the file name. Runs go to `runs/<timestamp>-<suite>/<run>/`, and at the end gentl prints a results table (verdict, self-report, turns, read tokens, notes max, questions, cost) and writes it to `results.md` and `results.json` in the suite directory. Aborting a run with Ctrl-C skips the remaining runs.
 
 ### Repeated runs
 
@@ -111,9 +111,13 @@ gentl asks for structured output (a JSON schema) so responses parse reliably; if
 
 The backend is recorded in `summary.json`. Runs with different backends are not directly comparable.
 
+### Stopping a run
+
+Ctrl-C aborts the run wherever it is: a running command is killed and a model call cancelled. The run is recorded with stop reason `aborted`, evaluated (its verdict is always a failure, and the friction report covers what happened up to the abort), and, with `--upload`, reported to the hub. A second Ctrl-C during the evaluation skips it. The sandbox is removed in every case. A command that hangs is also stopped by the 300 s timeout, and the agent is told. SIGTERM and SIGHUP (the process killed, the terminal closed) end the run with stop reason `interrupted`, without an evaluation or upload; the run directory is still written.
+
 ## Evaluation
 
-After a run that finishes (or reaches the turn limit), gentl records the final state of the workspace: for each git repo, `git status`, the commits and `git diff` against its upstream, and untracked files; also any loose files in the working directory. Then an evaluator (one model call) reads the full log, with the parts of each result that the agent did not see marked as such, the questions asked, the agent's finish report and the final state. It writes:
+After a run that finishes, reaches the turn limit or is aborted, gentl records the final state of the workspace: for each git repo, `git status`, the commits and `git diff` against its upstream, and untracked files; also any loose files in the working directory. Then an evaluator (one model call) reads the full log, with the parts of each result that the agent did not see marked as such, the questions asked, the agent's finish report and the final state. It writes:
 
 - a verdict: did the agent actually accomplish the task, judged from the evidence rather than the agent's claim;
 - a friction report: docs used, what was missing or wrong, where the agent guessed, signs of prior knowledge (commands or APIs it used that never appeared in anything it read), and the questions it asked.
@@ -131,7 +135,7 @@ The evaluator's tokens are not counted as reading effort. Reading effort should 
 A hub ([gentl-hub](https://github.com/magland/gentl-hub); the public one is https://gentl-hub.jeremy-magland.workers.dev) holds tasks with titles, shows the command to run each, and collects uploaded runs. gentl contacts a hub only when given a hub task URL or asked to upload.
 
 - `gentl run https://<hub>/tasks/<id>` fetches the task, prints its title and text, and asks before running it (`--yes` skips this). Hub tasks always clone the published repo, never a local copy, so uploaded results match public code.
-- `--upload` uploads each run that finished (or hit the turn limit) to that hub; `gentl upload runs/<id>` uploads one later, and `gentl upload runs/<batch>` uploads every run in a batch. A run goes only to the hub its task came from.
+- `--upload` uploads each run that finished, hit the turn limit or was aborted (Ctrl-C) to that hub; `gentl upload runs/<id>` uploads one later, and `gentl upload runs/<batch>` uploads every run in a batch. A run goes only to the hub its task came from.
 - The first upload to a hub asks for your name (shown with your runs) and the hub's passcode, and offers to remember them in `~/.config/gentl/hubs.json` (mode 0600). `GENTL_HUB_USER` and `GENTL_HUB_PASSCODE` override it.
 - The upload holds `summary.json`, `evaluation.json`, `final-state.md`, and each turn as the agent saw it (notes, action, shown result); full command output stays local.
 

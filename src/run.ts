@@ -73,7 +73,9 @@ export interface Summary {
   declined_actions: number;
   notes_reminders: number;
   asks: { turn: number; question: string }[];
-  stop_reason: "finish" | "max_turns" | "interrupted" | "error" | null;
+  // aborted: the person running gentl pressed Ctrl-C (evaluated as a failure, and uploaded);
+  // interrupted: SIGTERM or SIGHUP (not evaluated or uploaded).
+  stop_reason: "finish" | "max_turns" | "aborted" | "interrupted" | "error" | null;
   error: string | null;
   finished: boolean;
   self_reported_success: boolean | null;
@@ -211,16 +213,19 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
       lc ? [{ host: lc.mirrorDir, container: MIRROR_MOUNT }] : [])
     : new HostSandbox();
   // Signal handlers go in as soon as the sandbox exists, so no signal can leave it behind.
-  // Ctrl-C stops the running command, or cancels the model call and ends the run.
-  // SIGTERM and SIGHUP end the run wherever it is; the run directory is still completed.
-  // During cleanup further signals are ignored, so a second Ctrl-C cannot leave the sandbox behind.
+  // Ctrl-C aborts the run wherever it is (a running command is killed, a model call cancelled); the run is
+  // then evaluated as a failure and, with --upload, reported. SIGTERM and SIGHUP end it without either.
+  // The run directory is completed in every case. During cleanup further signals are ignored, so a
+  // second Ctrl-C cannot leave the sandbox behind.
   let abortModel: AbortController | null = null;
-  let stopRequested = false;
+  let abortRequested = false; // Ctrl-C
+  let stopRequested = false; // SIGTERM, SIGHUP
   let cleaningUp = false;
   const onSigint = () => {
     if (cleaningUp) return console.log("     still cleaning up (removing the sandbox); please wait");
-    if (sb.interrupt()) return;
-    stopRequested = true;
+    if (!abortRequested) console.log("\n     aborting the run (Ctrl-C); it will be evaluated as a failure and, with --upload, reported");
+    abortRequested = true;
+    sb.interrupt();
     abortModel?.abort();
   };
   const onTerm = () => {
@@ -289,7 +294,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   const seen = new Map<string, number[]>(); // action key -> turns it was taken
   try {
     for (let turn = 1; turn <= opts.maxTurns; turn++) {
-      if (stopRequested) throw new Interrupted();
+      if (stopRequested || abortRequested) throw new Interrupted();
       let user = `# Task\n${opts.task}\n\n# Your notes\n${notes || "(empty)"}\n`;
       if (last) user += `\n# Last action\n${last.action}\n\n# Result\n${last.result}\n`;
       const notesTok = ntok(notes);
@@ -423,7 +428,9 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     }
     if (!s.stop_reason) s.stop_reason = "max_turns";
   } catch (e) {
-    if (e instanceof Interrupted) s.stop_reason = "interrupted";
+    // Ctrl-C at a confirmation prompt arrives as Interrupted without a signal, so anything not SIGTERM or
+    // SIGHUP counts as the person's abort.
+    if (e instanceof Interrupted) s.stop_reason = stopRequested ? "interrupted" : "aborted";
     else {
       s.stop_reason = "error";
       s.error = (e as Error).message;
@@ -455,13 +462,14 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   console.log(`\n${formatSummary(s)}`);
   if (s.self_report_summary) console.log(`Agent's summary: ${s.self_report_summary}\n`);
   if (s.self_report_friction) console.log(`Agent's friction report: ${s.self_report_friction}\n`);
-  if (s.stop_reason === "finish" || s.stop_reason === "max_turns") {
+  const evaluable = s.stop_reason === "finish" || s.stop_reason === "max_turns" || s.stop_reason === "aborted";
+  if (evaluable) {
     const ev = await evaluate(runDir, opts.evaluatorModel);
     if (ev) s.evaluation = { model: ev.model, success: ev.success, reasons: ev.reasons, cost_usd: ev.cost_usd };
   }
   console.log(`Run directory: ${runDir}`);
   if (opts.upload) {
-    if (s.stop_reason === "finish" || s.stop_reason === "max_turns") {
+    if (evaluable) {
       try {
         console.log(`Uploaded: ${await uploadRun(runDir, opts.upload)}`);
       } catch (e) {

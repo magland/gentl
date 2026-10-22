@@ -109,7 +109,9 @@ export function buildEvaluatorInput(runDir: string): string {
   const asks = (summary.asks ?? []) as { turn: number; question: string }[];
   const finish = summary.finished
     ? `success: ${summary.self_reported_success}\nsummary: ${summary.self_report_summary}\nfriction: ${summary.self_report_friction ?? "(none given)"}`
-    : `The agent did not finish (stop reason: ${summary.stop_reason}).`;
+    : summary.stop_reason === "aborted"
+      ? `The person running gentl aborted the run (Ctrl-C) after turn ${summary.turns}, before the agent finished. The verdict is therefore a failure; write the reasons and the friction report from what happened up to that point.`
+      : `The agent did not finish (stop reason: ${summary.stop_reason}).`;
   const lc = summary.local_copy
     ? ` Clones of ${summary.local_copy.origin} were served from the maintainer's local working copy (with any uncommitted changes), so the agent's clone may differ from the published repo and its origin URL is a local file:// path; this is intended, not a problem with the run.`
     : "";
@@ -130,8 +132,12 @@ export async function evaluateRun(runDir: string, cfg: ModelConfig, signal: Abor
   } catch {
     throw new Error(`could not parse the evaluator's response: ${reply.text.slice(0, 300)}`);
   }
+  // An aborted run is a failure whatever the evaluator says; its reasons and friction report still stand.
+  const aborted = JSON.parse(fs.readFileSync(path.join(runDir, "summary.json"), "utf8")).stop_reason === "aborted";
+  const reasons = String(parsed.reasons ?? "");
   const ev: Evaluation = {
-    model: cfg.model, success: parsed.success, reasons: String(parsed.reasons ?? ""),
+    model: cfg.model, success: aborted ? false : parsed.success,
+    reasons: aborted ? `Aborted by the person running gentl before the agent finished. ${reasons}` : reasons,
     friction_report: String(parsed.friction_report ?? ""), structured_output: client.structured,
     usage: reply.usage, cost_usd: Number(reply.usage.cost ?? 0), input_chars: input.length, created: new Date().toISOString(),
   };

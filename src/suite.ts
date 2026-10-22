@@ -143,8 +143,8 @@ export async function runBatch(name: string, tasks: BatchTask[], repeat: number,
         const out = await runTask({ ...base, task: t.task, taskName: repeat > 1 ? `${t.taskName}-r${rep}` : t.taskName,
           taskSource: t.taskSource, runsDir: batchDir });
         rows.push(rowFor(t.taskName, rep, batchDir, out.runDir, out.summary));
-        if (out.summary.stop_reason === "interrupted") {
-          console.log("\nRun interrupted; skipping the remaining runs.");
+        if (out.summary.stop_reason === "interrupted" || out.summary.stop_reason === "aborted") {
+          console.log(`\nRun ${out.summary.stop_reason}; skipping the remaining runs.`);
           stopped = true;
         }
       } catch (e) {
