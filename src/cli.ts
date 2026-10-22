@@ -136,7 +136,10 @@ async function run(argv: string[]) {
       console.log(`Task ${t.id} from ${t.hub}: ${t.title}\n\n${t.text.replace(/^/gm, "    ")}\n`);
       if (!values.yes) {
         if (!process.stdin.isTTY) fail("a hub task needs confirming in a terminal (or pass --yes)");
-        if (!(await yesNo("Run this task? [y/n] "))) process.exit(0);
+        if (!(await yesNo("Run this task? [y/n] "))) {
+          console.log("Not running it.");
+          process.exit(0);
+        }
       }
       const slug = (t.title.toLowerCase().match(/[a-z0-9]+/g) ?? []).slice(0, 5).join("-");
       target = { kind: "task", task: t.text, taskName: `hub${t.id}${slug ? `-${slug}` : ""}`,
@@ -199,12 +202,14 @@ async function run(argv: string[]) {
   process.exit(code);
 }
 
+/** Ask a yes/no question; Ctrl-C or Ctrl-D counts as no. */
 function yesNo(question: string): Promise<boolean> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
+    // Resolve before closing: close() fires the "close" handler synchronously.
     rl.question(question, (a) => {
-      rl.close();
       resolve(/^y(es)?$/i.test(a.trim()));
+      rl.close();
     });
     rl.on("close", () => resolve(false));
   });
