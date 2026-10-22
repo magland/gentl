@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { parseArgs } from "node:util";
@@ -33,6 +34,8 @@ options:
   --share-home PATH   with --host, link this part of your home directory (e.g. .matlab) into the
                       agent's otherwise empty HOME; repeatable
   --pass-env NAME     with --host, pass this environment variable through as well; repeatable
+  --matlab-on-host    use the MATLAB installed on this machine: implies --host and shares the
+                      home folders MATLAB's licensing needs (.matlab, .MathWorks, .MATLABConnector)
   --yes               don't ask: run a hub task without confirming it, and with --host, run actions
                       without asking
   --upload            upload each finished run to the hub its task came from
@@ -51,6 +54,13 @@ options:
 
 The API key is read from OPENROUTER_API_KEY, in the environment or in ./.env.
 Runs are written to ./runs/<id>/.`;
+
+/** The home folders a licensed MATLAB keeps its licensing state in (R2025b, online licensing). */
+const MATLAB_HOME_DIRS = [".matlab", ".MathWorks", ".MATLABConnector"];
+
+function onPath(cmd: string): boolean {
+  return (process.env.PATH ?? "").split(path.delimiter).some((d) => d && fs.existsSync(path.join(d, cmd)));
+}
 
 /** A variable from the environment, or from ./.env. */
 function envValue(name: string): string | undefined {
@@ -80,6 +90,7 @@ async function run(argv: string[]) {
       yes: { type: "boolean" },
       local: { type: "boolean" },
       "share-home": { type: "string", multiple: true },
+      "matlab-on-host": { type: "boolean" },
       "pass-env": { type: "string", multiple: true },
       upload: { type: "boolean" },
       remote: { type: "boolean" },
@@ -98,6 +109,11 @@ async function run(argv: string[]) {
     return;
   }
   if ((values.task === undefined) === (positionals.length !== 1)) fail("give one task: a task file or -t TEXT");
+  // --matlab-on-host is --host plus MATLAB's home folders; set host first, since confirmation depends on it.
+  if (values["matlab-on-host"]) {
+    if (values.image) fail("--matlab-on-host runs on this machine, so --image does not apply");
+    values.host = true;
+  }
   if (values.host && values.image) fail("--image applies to the Docker sandbox, not --host");
   if (values.confirm && values.yes) fail("--confirm and --yes contradict each other");
   if (values.local && values.remote) fail("--local and --remote contradict each other");
@@ -110,7 +126,11 @@ async function run(argv: string[]) {
   const modelFor = modelConfig(values.backend, values["base-url"]!);
 
   let sandbox: RunOptions["sandbox"];
-  const shareHome = values["share-home"] ?? [];
+  const shareHome = [...(values["share-home"] ?? []),
+    ...(values["matlab-on-host"] ? MATLAB_HOME_DIRS.filter((d) => fs.existsSync(path.join(os.homedir(), d))) : [])];
+  if (values["matlab-on-host"] && !onPath("matlab")) {
+    console.log("warning: --matlab-on-host, but there is no matlab command on your PATH, so the agent will not find one either");
+  }
   const passEnv = values["pass-env"] ?? [];
   if (!values.host && (shareHome.length || passEnv.length)) fail("--share-home and --pass-env apply only with --host");
   for (const p of shareHome) {

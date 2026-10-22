@@ -33,6 +33,7 @@ Options:
 
 - `--image IMG`: the Docker image for the sandbox. The default is built on first use from [sandbox/Dockerfile](sandbox/Dockerfile) and tagged by its content (`gentl-sandbox:<hash>`).
 - `--host`: run on this machine in a fresh temp directory instead of Docker, for software that can't run in a container (for example a licensed MATLAB).
+- `--matlab-on-host`: `--host` set up for the MATLAB installed on this machine; see Host mode.
 - `--confirm`: ask before each action. This is the default with `--host`; Docker runs are unattended unless you pass it.
 - `--yes`: with `--host`, run actions without asking.
 - `--model M`: the agent's model, default `anthropic/claude-haiku-5.5`.
@@ -70,10 +71,10 @@ The agent works in `work/` inside a fresh temp directory, with `HOME` set to a s
 
 The agent can still reach anything on your machine that you can, so by default gentl shows each action and asks `ok? [y/n]` before running it. On `n` you can give a reason, which is passed back to the agent.
 
-Some licensed software keeps its licensing state in your home directory, which the agent's empty HOME does not have. `--share-home PATH` (repeatable) links that part of your real home directory into the agent's HOME, read and write, leaving the rest hidden; `--pass-env NAME` (repeatable) passes one more environment variable through. Both are printed at the start and recorded in `summary.json`. For MATLAB (tested with R2025b and online licensing; without them it fails with licensing error 5201):
+Some licensed software keeps its licensing state in your home directory, which the agent's empty HOME does not have. `--share-home PATH` (repeatable) links that part of your real home directory into the agent's HOME, read and write, leaving the rest hidden; `--pass-env NAME` (repeatable) passes one more environment variable through. Both are printed at the start and recorded in `summary.json`. For MATLAB there is a shortcut, `--matlab-on-host`: it implies `--host` and shares `.matlab`, `.MathWorks` and `.MATLABConnector` (those that exist), which MATLAB's licensing needs (tested with R2025b and online licensing; without them MATLAB fails with licensing error 5201). It warns if there is no `matlab` command on your PATH. As with `--host`, add `--yes` to run without confirming each action:
 
 ```
-gentl run TASK --host --share-home .matlab --share-home .MathWorks --share-home .MATLABConnector
+gentl run TASK --matlab-on-host --yes
 ```
 
 Host mode also inherits whatever is installed on your machine (compilers, Python packages, uv), so setup steps can succeed without the docs being followed, and reading effort is not comparable with Docker runs.
