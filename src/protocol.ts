@@ -9,7 +9,9 @@ export interface AgentResponse {
   action: Action;
 }
 
-export const ACTION_TYPES = ["run", "write_file", "edit_file", "finish"];
+export const ACTION_TYPES = ["run", "write_file", "edit_file", "ask", "finish"];
+
+export const ASK_RESULT = "No one is available to answer. Your question is recorded as a gap in the docs. Decide from the docs and code as best you can.";
 export const DEFAULT_MAX_CHARS = 2000;
 export const MAX_MAX_CHARS = 20000;
 export const CMD_TIMEOUT_S = 300;
@@ -19,7 +21,7 @@ export function systemPrompt(workdir: string): string {
 
 Treat the software as unfamiliar. Go by its docs and code, not by what you remember about it, since the version here may differ.
 
-This is a test of how readable the software and its docs are. We count the tokens you read (every result you see, plus your notes each turn) as a proxy for the effort a human newcomer would need, and we collect what was missing or unclear. So read in a targeted way (grep, sed -n, head, --help) rather than dumping whole files or long pages. A gap in the docs is useful feedback, not a failure on your part.
+This is a test of how readable the software and its docs are. We count the tokens you read (every result you see, plus your notes each turn) as a proxy for the effort a human newcomer would need, and we collect what was missing or unclear. So read in a targeted way (grep, sed -n, head, --help) rather than dumping whole files or long pages. When the docs and code don't answer something you need, don't keep searching or guess silently: use the ask action, then make a reasonable decision and move on. A gap in the docs is useful feedback, not a failure on your part.
 
 You have no memory between turns. Each turn you see only the task, your notes, and your last action with its result (shown once). Your notes are your working memory, like what a person can hold in their head at once: keep them small, with only what you still need (key facts, where things are, what is done, what is next). They are counted every turn.
 
@@ -31,6 +33,7 @@ Actions:
 - {"type": "run", "cmd": "..."}: run with bash in your working directory. Each command starts a fresh shell (cd and exported variables do not persist) with no input. stdout and stderr are combined; output longer than ${DEFAULT_MAX_CHARS} characters is cut in the middle (add "max_chars": N, at most ${MAX_MAX_CHARS}, to see more). Timeout ${CMD_TIMEOUT_S} s.
 - {"type": "write_file", "path": "...", "content": "..."}: create or overwrite a file. Relative paths are under your working directory.
 - {"type": "edit_file", "path": "...", "old": "...", "new": "..."}: replace text that occurs exactly once in the file.
+- {"type": "ask", "question": "..."}: ask the maintainers something the docs and code don't tell you. No one will answer during this test; the question is recorded as feedback on the docs.
 - {"type": "finish", "success": true|false, "summary": "...", "friction": "..."}: end the task. Verify your work before finishing. If success is true, the summary must cite the evidence: what you ran and what it showed. "friction" (optional) is what in the docs was missing, wrong or unclear, and where you had to guess.
 
 A person watching may decline an action; the result then says so, with their reason if they gave one.`;
@@ -51,6 +54,7 @@ export const RESPONSE_SCHEMA = obj({
       obj({ type: actionType("run"), cmd: str, max_chars: { type: "integer" } }, ["type", "cmd"]),
       obj({ type: actionType("write_file"), path: str, content: str }, ["type", "path", "content"]),
       obj({ type: actionType("edit_file"), path: str, old: str, new: str }, ["type", "path", "old", "new"]),
+      obj({ type: actionType("ask"), question: str }, ["type", "question"]),
       obj({ type: actionType("finish"), success: { type: "boolean" }, summary: str, friction: str }, ["type", "success", "summary"]),
     ],
   },
@@ -76,8 +80,8 @@ function matchBrace(s: string, start: number): number {
   return -1;
 }
 
-/** The first JSON object in the text that contains an "action" object; anything around it is ignored. */
-export function parseResponse(text: string): AgentResponse {
+/** The first JSON object in the text that satisfies `accept`; anything around it is ignored. */
+export function parseFirstJson(text: string, accept: (v: Record<string, unknown>) => boolean): Record<string, unknown> {
   for (let i = text.indexOf("{"); i !== -1; i = text.indexOf("{", i + 1)) {
     const end = matchBrace(text, i);
     if (end === -1) continue;
@@ -87,9 +91,18 @@ export function parseResponse(text: string): AgentResponse {
     } catch {
       continue;
     }
-    if (isObject(v) && isObject(v.action)) return v as unknown as AgentResponse;
+    if (isObject(v) && accept(v)) return v;
   }
-  throw new Error('no JSON object with an "action" object was found');
+  throw new Error("no matching JSON object was found");
+}
+
+/** The first JSON object in the text that contains an "action" object. */
+export function parseResponse(text: string): AgentResponse {
+  try {
+    return parseFirstJson(text, (v) => isObject(v.action)) as unknown as AgentResponse;
+  } catch {
+    throw new Error('no JSON object with an "action" object was found');
+  }
 }
 
 export function countOccurrences(text: string, sub: string): number {
@@ -141,6 +154,8 @@ export function validateAction(a: Action): string | null {
       return str("path") && str("content") ? null : 'write_file needs "path" and "content" (strings)';
     case "edit_file":
       return str("path") && str("old") && str("new") ? null : 'edit_file needs "path", "old" and "new" (strings)';
+    case "ask":
+      return str("question") ? null : 'ask needs "question" (string)';
     case "finish":
       if (typeof a.success !== "boolean" || !str("summary")) return 'finish needs "success" (boolean) and "summary" (string)';
       if (a.friction !== undefined && !str("friction")) return '"friction" must be a string';
@@ -158,6 +173,8 @@ export function describeAction(a: Action): string {
     case "write_file":
     case "edit_file":
       return `${a.type}: ${a.path}`;
+    case "ask":
+      return `ask: ${a.question}`;
     default:
       return JSON.stringify(a);
   }

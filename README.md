@@ -2,7 +2,7 @@
 
 A readability test for codebases. A memoryless agent carries out a realistic task the way a newcomer would (clone the repo, set up the environment from the docs, make a change, verify it), and gentl measures how much the agent had to read. The premise is that if an agent with no memory beyond a small set of notes can do the task, a human newcomer probably can too.
 
-gentl is an evaluation tool, not a coding agent; the code the agent writes is a by-product. The main output is the reading effort, which is mostly useful as a trend over doc changes. An evaluator verdict and a friction report (what was missing or wrong in the docs) are planned.
+gentl is an evaluation tool, not a coding agent; the code the agent writes is a by-product. There are two outputs: the reading effort (a number, mostly useful as a trend over doc changes) and a friction report from an evaluator (what was missing or wrong in the docs, and where the agent guessed).
 
 Status: early. Only host mode is implemented, and you confirm each action before it runs.
 
@@ -31,7 +31,8 @@ A task is plain text. It names the repos to clone and, where it matters, the tag
 Options:
 
 - `--host`: run on this machine in a fresh temp directory. Required for now; a Docker sandbox will become the default.
-- `--model M`: default `anthropic/claude-haiku-5.5`.
+- `--model M`: the agent's model, default `anthropic/claude-haiku-5.5`.
+- `--evaluator-model M`: the evaluator's model, same default.
 - `--base-url URL`: any OpenAI-compatible endpoint (default `https://openrouter.ai/api/v1`). The key in `OPENROUTER_API_KEY` is sent to it.
 - `--max-turns N`: default 50.
 - `--keep`: keep the temp workspace instead of deleting it.
@@ -56,9 +57,25 @@ Actions:
 
 - `run {cmd, max_chars?}`: bash in the working directory. stdout and stderr are combined. Output longer than `max_chars` (default 2000, at most 20000) is cut in the middle, keeping the head and tail.
 - `write_file {path, content}` and `edit_file {path, old, new}` (`old` must occur exactly once).
+- `ask {question}`: no one answers. The question is recorded as a gap in the docs, and the agent is told to decide from the docs and code.
 - `finish {success, summary, friction?}`: the summary cites the evidence of success; `friction` is the agent's own account of what was missing or unclear in the docs.
 
 With OpenRouter, gentl asks for structured output (a JSON schema) so responses parse reliably; if the endpoint rejects it, gentl falls back to plain text and parses the first JSON object that contains an `action`.
+
+## Evaluation
+
+After a run that finishes (or reaches the turn limit), gentl records the final state of the workspace: for each git repo, `git status`, the commits and `git diff` against its upstream, and untracked files; also any loose files in the working directory. Then an evaluator (one model call) reads the full log, with the parts of each result that the agent did not see marked as such, the questions asked, the agent's finish report and the final state. It writes:
+
+- a verdict: did the agent actually accomplish the task, judged from the evidence rather than the agent's claim;
+- a friction report: docs used, what was missing or wrong, where the agent guessed, signs of prior knowledge (commands or APIs it used that never appeared in anything it read), and the questions it asked.
+
+The evaluator reads only the run directory, so a run can be evaluated again later, for example with another model:
+
+```
+gentl evaluate runs/<id> --evaluator-model anthropic/claude-sonnet-5.5
+```
+
+The evaluator's tokens are not counted as reading effort. Reading effort should be compared only among runs that the evaluator judged successful, with the same agent model.
 
 ## Measurement
 
@@ -69,15 +86,17 @@ Tokens are counted with tiktoken `o200k_base` on exactly what the agent sees, so
 - `result_tokens_*`: the echoed action plus its result, per turn.
 - `overhead_tokens`: system prompt plus task, counted once.
 
-Also recorded: turns, model output tokens, provider-reported tokens and cost, parse errors, invalid, repeated and declined actions.
+Also recorded: turns, model output tokens, provider-reported tokens and cost, parse errors, invalid, repeated and declined actions, and the questions asked.
 
 ## Run directory
 
 Each run is written to `./runs/<YYYYMMDD-HHMMSS>-<task name>/`:
 
-- `events.jsonl`: a `start` event, one `turn` event per turn (full model input and response, parsed response, notes, full and shown result, token counts, provider usage), and an `end` event.
+- `events.jsonl`: a `start` event, one `turn` event per turn (full model input and response, parsed response, notes, full and shown result, where the shown result was cut, token counts, provider usage), and an `end` event.
 - `summary.json`: totals and settings, with a `format` version (currently 1).
-- `transcript.md`: the task, system prompt and each turn as the agent saw it, for a human or an evaluator to read.
+- `transcript.md`: the task, system prompt and each turn as the agent saw it.
+- `final-state.md`: the final state of the workspace (see Evaluation).
+- `evaluation.json` and `friction.md`: the evaluator's verdict and friction report. The verdict is also copied into `summary.json` under `evaluation`.
 
 ## License
 

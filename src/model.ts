@@ -1,7 +1,5 @@
 // Calls to an OpenAI-compatible chat completions endpoint (OpenRouter by default).
 
-import { RESPONSE_SCHEMA } from "./protocol.js";
-
 export interface ModelConfig {
   model: string;
   baseUrl: string;
@@ -26,7 +24,9 @@ export class ModelClient {
   structured = true;
   private openrouter: boolean;
 
-  constructor(private cfg: ModelConfig, private log: (msg: string) => void) {
+  /** `schema` is the JSON schema requested for responses (structured output). */
+  constructor(private cfg: ModelConfig, private schema: { name: string; schema: object },
+    private log: (msg: string) => void) {
     this.openrouter = cfg.baseUrl.includes("openrouter.ai");
   }
 
@@ -89,7 +89,7 @@ export class ModelClient {
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
     };
     if (this.structured) {
-      body.response_format = { type: "json_schema", json_schema: { name: "turn", strict: true, schema: RESPONSE_SCHEMA } };
+      body.response_format = { type: "json_schema", json_schema: { name: this.schema.name, strict: true, schema: this.schema.schema } };
     }
     if (this.openrouter) {
       body.usage = { include: true };

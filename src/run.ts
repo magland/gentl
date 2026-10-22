@@ -4,7 +4,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { Interrupted, ModelClient, type ModelConfig } from "./model.js";
-import { applyNotes, describeAction, parseResponse, systemPrompt, validateAction, type Action } from "./protocol.js";
+import { evaluateRun } from "./evaluate.js";
+import { describeFinalState, type RepoState } from "./finalstate.js";
+import { applyNotes, ASK_RESULT, describeAction, parseResponse, RESPONSE_SCHEMA, systemPrompt, validateAction,
+  type Action } from "./protocol.js";
+import { fence } from "./format.js";
 import { ntok } from "./tokens.js";
 import { HostWorkspace } from "./workspace.js";
 
@@ -15,6 +19,7 @@ export interface RunOptions {
   taskName: string;
   taskSource: { kind: "file"; path: string } | { kind: "text" };
   model: ModelConfig;
+  evaluatorModel: ModelConfig;
   maxTurns: number;
   keep: boolean;
   version: string;
@@ -50,20 +55,15 @@ interface Summary {
   invalid_actions: number;
   repeated_actions: number;
   declined_actions: number;
+  asks: { turn: number; question: string }[];
   stop_reason: "finish" | "max_turns" | "interrupted" | "error" | null;
   error: string | null;
   finished: boolean;
   self_reported_success: boolean | null;
   self_report_summary: string | null;
   self_report_friction: string | null;
-}
-
-/** Code block whose fence is longer than any backtick run in the text. */
-function fence(text: string, lang = ""): string {
-  const runs = text.match(/`{3,}/g) ?? [];
-  const n = Math.max(3, ...runs.map((r) => r.length + 1));
-  const f = "`".repeat(n);
-  return `${f}${lang}\n${text.replace(/\n+$/, "")}\n${f}\n`;
+  final_repos: RepoState[] | null;
+  evaluation?: { model: string; success: boolean; reasons: string; cost_usd: number };
 }
 
 function formatAction(a: Action): string {
@@ -74,6 +74,8 @@ function formatAction(a: Action): string {
       return `### Action: write_file \`${a.path}\`\n${fence(String(a.content))}`;
     case "edit_file":
       return `### Action: edit_file \`${a.path}\`\nold:\n${fence(String(a.old))}new:\n${fence(String(a.new))}`;
+    case "ask":
+      return `### Action: ask\n\n${a.question}\n`;
     case "finish":
       return `### Action: finish (success: ${a.success})\n\n${a.summary}\n${a.friction ? `\nFriction:\n\n${a.friction}\n` : ""}`;
     default:
@@ -94,6 +96,7 @@ function formatSummary(s: Summary): string {
     ["Model output tokens", s.model_output_tokens],
     ["Parse errors / invalid / repeated / declined actions",
       `${s.parse_errors} / ${s.invalid_actions} / ${s.repeated_actions} / ${s.declined_actions}`],
+    ["Questions asked", s.asks.length],
     ["Cost", `$${s.cost_usd.toFixed(4)}`],
     ["Duration", `${Math.round(s.duration_s)} s`],
   ];
@@ -156,6 +159,8 @@ function actionLine(a: Action): string {
     case "write_file":
     case "edit_file":
       return `${a.type}: ${a.path}`;
+    case "ask":
+      return `ask: ${firstLine(String(a.question), 90)}`;
     case "finish":
       return `finish: ${a.success ? "success" : "failure"}`;
     default:
@@ -184,7 +189,7 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
 
   const ws = new HostWorkspace();
   const system = systemPrompt(ws.workdir);
-  const client = new ModelClient(opts.model, log);
+  const client = new ModelClient(opts.model, { name: "turn", schema: RESPONSE_SCHEMA }, log);
   const s: Summary = {
     format: FORMAT_VERSION, gentl_version: opts.version, run_id: runId, task_name: opts.taskName,
     task_source: opts.taskSource, task: opts.task, model: opts.model.model, base_url: opts.model.baseUrl,
@@ -192,9 +197,9 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
     system_prompt: system, overhead_tokens: ntok(system) + ntok(opts.task), turns: 0,
     read_tokens_total: 0, notes_tokens_total: 0, notes_tokens_max: 0, result_tokens_total: 0, result_tokens_max: 0,
     model_output_tokens: 0, provider_prompt_tokens: 0, provider_completion_tokens: 0, cost_usd: 0,
-    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0,
+    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0, asks: [],
     stop_reason: null, error: null, finished: false,
-    self_reported_success: null, self_report_summary: null, self_report_friction: null,
+    self_reported_success: null, self_report_summary: null, self_report_friction: null, final_repos: null,
   };
   const source = opts.taskSource.kind === "file" ? opts.taskSource.path : "given on the command line";
 
@@ -304,6 +309,9 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
       if (invalid) {
         s.invalid_actions++;
         full = shown = `error: malformed action: ${invalid}`;
+      } else if (a.type === "ask") {
+        s.asks.push({ turn, question: String(a.question) });
+        full = shown = ASK_RESULT;
       } else {
         const reason = await confirm(a, line.replace(/^run: /, ""));
         if (reason !== null) {
@@ -313,7 +321,7 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
         } else if (a.type === "run") {
           const r = await ws.run(String(a.cmd), a.max_chars as number | undefined);
           ({ full, shown } = r);
-          Object.assign(ev, { exit_code: r.exitCode, signal: r.signal, cmd_seconds: r.seconds, timed_out: r.timedOut,
+          Object.assign(ev, { truncation: r.truncation ?? undefined, exit_code: r.exitCode, signal: r.signal, cmd_seconds: r.seconds, timed_out: r.timedOut,
             interrupted: r.interrupted });
         } else if (a.type === "write_file") {
           full = shown = ws.writeFile(String(a.path), String(a.content));
@@ -323,7 +331,7 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
       }
       shown = [...notices, ...n.feedback, shown].join("\n");
       last = { action: describeAction(a), result: shown };
-      emit({ ...ev, result_full: full, result_shown: shown });
+      emit({ ...ev, notices, result_full: full, result_shown: shown });
       const truncNote = shown.length < full.length ? `; truncated, full result ${full.length} chars in events.jsonl` : "";
       tr(`### Result (${ntok(shown)} tokens${truncNote})\n${fence(shown)}`);
     }
@@ -341,6 +349,13 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
     const ended = new Date();
     s.ended = ended.toISOString();
     s.duration_s = (ended.getTime() - started.getTime()) / 1000;
+    try {
+      const fin = describeFinalState(ws.workdir, ws.env);
+      fs.writeFileSync(path.join(runDir, "final-state.md"), fin.text);
+      s.final_repos = fin.repos;
+    } catch (e) {
+      log(`could not record the final state: ${(e as Error).message}`);
+    }
     fs.writeFileSync(path.join(runDir, "summary.json"), JSON.stringify(s, null, 2) + "\n");
     emit({ type: "end", stop_reason: s.stop_reason, error: s.error });
     tr(`---\n\n## Summary\n\n${formatSummary(s)}`);
@@ -352,6 +367,27 @@ export async function runTask(opts: RunOptions): Promise<boolean> {
   console.log(`\n${formatSummary(s)}`);
   if (s.self_report_summary) console.log(`Agent's summary: ${s.self_report_summary}\n`);
   if (s.self_report_friction) console.log(`Agent's friction report: ${s.self_report_friction}\n`);
+  if (s.stop_reason === "finish" || s.stop_reason === "max_turns") await evaluate(runDir, opts.evaluatorModel);
   console.log(`Run directory: ${runDir}`);
   return s.stop_reason !== "error";
+}
+
+/** Run the evaluator on a run directory and print its verdict and friction report. Ctrl-C skips it. */
+export async function evaluate(runDir: string, cfg: ModelConfig): Promise<boolean> {
+  console.log(`Evaluating with ${cfg.model} ...`);
+  const ac = new AbortController();
+  const onSigint = () => ac.abort();
+  process.on("SIGINT", onSigint);
+  try {
+    const ev = await evaluateRun(runDir, cfg, ac.signal, (msg) => console.log(`     ${msg}`));
+    console.log(`\nVerdict: ${ev.success ? "success" : "failure"}\n\n${ev.reasons}\n\nFriction report:\n\n${ev.friction_report}\n`);
+    console.log(`Evaluator cost: $${ev.cost_usd.toFixed(4)}; written to friction.md, evaluation.json and summary.json`);
+    return true;
+  } catch (e) {
+    const msg = e instanceof Interrupted ? "interrupted" : (e as Error).message;
+    console.log(`Evaluation skipped (${msg}). Run it later with: gentl evaluate ${path.relative(process.cwd(), runDir)}`);
+    return false;
+  } finally {
+    process.off("SIGINT", onSigint);
+  }
 }

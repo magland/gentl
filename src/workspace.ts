@@ -18,6 +18,7 @@ export interface RunResult {
   signal: string | null;
   full: string; // everything captured (up to 2 MB)
   shown: string; // what the agent sees
+  truncation: { head: number; tail: number } | null; // chars of `full` shown at the start and end, if cut
   seconds: number;
   timedOut: boolean;
   interrupted: boolean;
@@ -66,7 +67,7 @@ export class HostWorkspace {
   readonly root: string;
   readonly workdir: string;
   readonly home: string;
-  private env: NodeJS.ProcessEnv;
+  readonly env: NodeJS.ProcessEnv;
   private current: { child: ChildProcess; interrupted: boolean } | null = null;
   private groups = new Set<number>(); // process groups of all commands, killed on remove()
 
@@ -110,8 +111,10 @@ export class HostWorkspace {
         const out = cap.text();
         const status = cur.interrupted ? "stopped by the person running gentl (Ctrl-C)"
           : timedOut ? `timed out after ${CMD_TIMEOUT_S} s` : code !== null ? `exit code ${code}` : `killed by ${signal}`;
+        const truncation = out.length > maxChars
+          ? { head: status.length + 1 + Math.floor((maxChars * 3) / 5), tail: Math.floor((maxChars * 2) / 5) } : null;
         resolve({ exitCode: code, signal, full: `${status}\n${out}`, shown: `${status}\n${truncate(out, maxChars)}`,
-          seconds: (Date.now() - t0) / 1000, timedOut, interrupted: cur.interrupted });
+          truncation, seconds: (Date.now() - t0) / 1000, timedOut, interrupted: cur.interrupted });
       };
       child.on("error", (e) => {
         cap.add(Buffer.from(`error: ${e.message}\n`));
