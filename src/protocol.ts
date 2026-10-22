@@ -14,7 +14,7 @@ export const ACTION_TYPES = ["run", "read_file", "write_file", "edit_file", "ask
 export const READ_MAX_CHARS = 20000; // a read_file result stops at a line boundary before this
 
 export const ASK_RESULT = "No one is available to answer. Your question is recorded as a gap in the docs. Decide from the docs and code as best you can.";
-export const DEFAULT_MAX_CHARS = 2000;
+export const DEFAULT_MAX_CHARS = 4000;
 export const MAX_MAX_CHARS = 20000;
 export const CMD_TIMEOUT_S = 300;
 
