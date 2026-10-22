@@ -4,7 +4,7 @@ A readability test for codebases. A memoryless agent carries out a realistic tas
 
 gentl is an evaluation tool, not a coding agent; the code the agent writes is a by-product. There are two outputs: the reading effort (a number, mostly useful as a trend over doc changes) and a friction report from an evaluator (what was missing or wrong in the docs, and where the agent guessed).
 
-Status: early; the hub, uploads and repeated runs are not implemented yet.
+Status: early.
 
 ## Install
 
@@ -25,6 +25,7 @@ For the default backend, set `OPENROUTER_API_KEY` in the environment or in a `.e
 gentl run TASK.md
 gentl run -t "Clone https://github.com/owner/foo, install it and run its tests."
 gentl run tasks/            # a suite: every *.md in the directory
+gentl run https://<hub>/tasks/42 --upload   # a task from a hub; see Hub
 ```
 
 A task is plain text. It names the repos to clone and, where it matters, the tag or commit; the agent does the cloning itself.
@@ -37,6 +38,8 @@ Options:
 - `--yes`: with `--host`, run actions without asking.
 - `--model M`: the agent's model, default `anthropic/claude-haiku-5.5`.
 - `--evaluator-model M`: the evaluator's model, same default.
+- `--upload`: upload each finished run to the hub its task came from.
+- `--yes`: don't ask before running a hub task (and, with `--host`, before each action).
 - `--backend B`: `openrouter` (default) or `claude-code`; see Backends.
 - `--local` / `--remote`: serve clones of the task's repo from your checkout (the default inside a git repo), or clone the published repo; see Local copy.
 - `--base-url URL`: any OpenAI-compatible endpoint (default `https://openrouter.ai/api/v1`). The key in `OPENROUTER_API_KEY` is sent to it.
@@ -120,6 +123,15 @@ gentl evaluate runs/<id> --evaluator-model anthropic/claude-sonnet-5.5
 ```
 
 The evaluator's tokens are not counted as reading effort. Reading effort should be compared only among runs that the evaluator judged successful, with the same agent model.
+
+## Hub
+
+A hub ([gentl-hub](https://github.com/magland/gentl-hub)) holds tasks with titles, shows the command to run each, and collects uploaded runs. gentl contacts a hub only when given a hub task URL or asked to upload.
+
+- `gentl run https://<hub>/tasks/<id>` fetches the task, prints its title and text, and asks before running it (`--yes` skips this). Hub tasks always clone the published repo, never a local copy, so uploaded results match public code.
+- `--upload` uploads each run that finished (or hit the turn limit) to that hub; `gentl upload runs/<id>` uploads one later, and `gentl upload runs/<batch>` uploads every run in a batch. A run goes only to the hub its task came from.
+- The first upload to a hub asks for your name (shown with your runs) and the hub's passcode, and offers to remember them in `~/.config/gentl/hubs.json` (mode 0600). `GENTL_HUB_USER` and `GENTL_HUB_PASSCODE` override it.
+- The upload holds `summary.json`, `evaluation.json`, `final-state.md`, and each turn as the agent saw it (notes, action, shown result); full command output stays local.
 
 ## Measurement
 

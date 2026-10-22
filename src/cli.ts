@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as readline from "node:readline";
 import { parseArgs } from "node:util";
 import { checkDocker, ensureDefaultImage } from "./docker.js";
+import { fetchHubTask, hubCredentials, parseHubTaskUrl, runDirsIn, runHub, uploadRun, type HubCredentials } from "./hub.js";
 import { findRepo, prepareLocalCopy, removeLocalCopy, type LocalCopy } from "./localcopy.js";
 import type { ModelConfig } from "./model.js";
-import { evaluate, runTask } from "./run.js";
+import { evaluate, runTask, type RunOptions } from "./run.js";
 import { runBatch, suiteTasks } from "./suite.js";
 
 const VERSION: string = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -16,16 +18,20 @@ const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const USAGE = `gentl ${VERSION}: a readability test for codebases
 
 usage:
-  gentl run (TASK.md | DIR | -t TEXT) [options]   run the agent on a task, then evaluate the run;
-                                                 DIR runs each *.md in it as a suite
-  gentl evaluate RUN_DIR [options]                (re-)evaluate a finished run
+  gentl run (TASK.md | DIR | URL | -t TEXT) [options]
+                                  run the agent on a task, then evaluate the run; DIR runs each
+                                  *.md in it as a suite; URL is a task on a hub (https://<hub>/tasks/<id>)
+  gentl evaluate RUN_DIR [options]  (re-)evaluate a finished run
+  gentl upload RUN_DIR...           upload runs (or batch directories of runs) to their task's hub
 
 options:
   -t, --task TEXT     task text given directly
   --image IMG         Docker image for the sandbox (default: built from gentl's sandbox/Dockerfile)
   --host              run in a fresh temp directory on this machine instead of Docker
   --confirm           ask before each action (the default with --host)
-  --yes               with --host, run actions without asking
+  --yes               don't ask: run a hub task without confirming it, and with --host, run actions
+                      without asking
+  --upload            upload each finished run to the hub its task came from
   --model M           model for the agent (default ${DEFAULT_MODEL})
   --evaluator-model M model for the evaluator (default ${DEFAULT_MODEL})
   --backend B         openrouter (any OpenAI-compatible endpoint; key in OPENROUTER_API_KEY) or
@@ -69,6 +75,7 @@ async function run(argv: string[]) {
       confirm: { type: "boolean" },
       yes: { type: "boolean" },
       local: { type: "boolean" },
+      upload: { type: "boolean" },
       remote: { type: "boolean" },
       model: { type: "string", default: DEFAULT_MODEL },
       "evaluator-model": { type: "string", default: DEFAULT_MODEL },
@@ -110,24 +117,54 @@ async function run(argv: string[]) {
   }
   // What to run: a suite directory, a task file, or task text.
   let target: { kind: "suite"; dir: string } | { kind: "task"; task: string; taskName: string;
-    taskSource: { kind: "file"; path: string } | { kind: "text" } };
+    taskSource: RunOptions["taskSource"] };
   if (values.task !== undefined) {
     const task = values.task.trim();
     target = { kind: "task", task, taskName: (task.toLowerCase().match(/[a-z0-9]+/g) ?? ["task"]).slice(0, 5).join("-"),
       taskSource: { kind: "text" } };
   } else {
     const p = positionals[0];
-    if (/^https?:\/\//.test(p)) fail("hub tasks are not supported yet");
-    if (!fs.existsSync(p)) fail(`no such file: ${p}`);
-    target = fs.statSync(p).isDirectory() ? { kind: "suite", dir: p }
+    if (/^https?:\/\//.test(p)) {
+      if (!parseHubTaskUrl(p)) fail(`not a hub task URL: ${p} (expected https://<hub>/tasks/<id>)`);
+      if (values.local) fail("--local does not apply to hub tasks; they always clone the published repo");
+      let t;
+      try {
+        t = await fetchHubTask(p);
+      } catch (e) {
+        fail((e as Error).message);
+      }
+      console.log(`Task ${t.id} from ${t.hub}: ${t.title}\n\n${t.text.replace(/^/gm, "    ")}\n`);
+      if (!values.yes) {
+        if (!process.stdin.isTTY) fail("a hub task needs confirming in a terminal (or pass --yes)");
+        if (!(await yesNo("Run this task? [y/n] "))) process.exit(0);
+      }
+      const slug = (t.title.toLowerCase().match(/[a-z0-9]+/g) ?? []).slice(0, 5).join("-");
+      target = { kind: "task", task: t.text, taskName: `hub${t.id}${slug ? `-${slug}` : ""}`,
+        taskSource: { kind: "hub", url: t.url, hub: t.hub, id: t.id, title: t.title } };
+    } else if (!fs.existsSync(p)) fail(`no such file: ${p}`);
+    else target = fs.statSync(p).isDirectory() ? { kind: "suite", dir: p }
       : { kind: "task", task: fs.readFileSync(p, "utf8").trim(), taskName: path.basename(p).replace(/\.[^.]*$/, ""),
         taskSource: { kind: "file", path: p } };
   }
   if (target.kind === "task" && !target.task) fail("the task is empty");
 
+  // Uploads go to the hub the task came from; credentials are settled before any run starts.
+  let upload: HubCredentials | null = null;
+  if (values.upload) {
+    if (target.kind !== "task" || target.taskSource.kind !== "hub") fail("--upload works only for tasks from a hub");
+    try {
+      upload = await hubCredentials(target.taskSource.hub);
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  }
+
   // The local copy: the repo containing the task file or suite (or the current directory for -t).
+  // Hub tasks always clone the published repo, so their results match public code.
+  const isHub = target.kind === "task" && target.taskSource.kind === "hub";
+  if (isHub && values.local) fail("--local does not apply to hub tasks; they always clone the published repo");
   let localCopy: LocalCopy | null = null;
-  if (!values.remote) {
+  if (!values.remote && !isHub) {
     const dir = target.kind === "suite" ? target.dir : target.taskSource.kind === "file" ? path.dirname(target.taskSource.path) : ".";
     const found = findRepo(path.resolve(dir));
     if ("reason" in found) {
@@ -141,7 +178,7 @@ async function run(argv: string[]) {
     }
   }
 
-  const common = { sandbox, confirm, localCopy, maxTurns, keep: !!values.keep, version: VERSION,
+  const common = { sandbox, confirm, localCopy, upload, maxTurns, keep: !!values.keep, version: VERSION,
     model: modelFor(values.model!), evaluatorModel: modelFor(values["evaluator-model"]!) };
   let code = 0;
   try {
@@ -160,6 +197,41 @@ async function run(argv: string[]) {
     if (localCopy) removeLocalCopy(localCopy);
   }
   process.exit(code);
+}
+
+function yesNo(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (a) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(a.trim()));
+    });
+    rl.on("close", () => resolve(false));
+  });
+}
+
+async function uploadCommand(argv: string[]) {
+  const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { help: { type: "boolean", short: "h" } } });
+  if (values.help || !positionals.length) {
+    console.log(USAGE);
+    process.exit(values.help ? 0 : 2);
+  }
+  const dirs = positionals.flatMap((p) => (fs.existsSync(p) ? runDirsIn(p) : fail(`no such directory: ${p}`)));
+  if (!dirs.length) fail("no run directories found");
+  const creds = new Map<string, HubCredentials>();
+  let failed = 0;
+  for (const dir of dirs) {
+    try {
+      const hub = runHub(dir);
+      if (!hub) throw new Error("its task did not come from a hub, so there is nowhere to upload it");
+      if (!creds.has(hub)) creds.set(hub, await hubCredentials(hub));
+      console.log(`${dir}: uploaded ${await uploadRun(dir, creds.get(hub)!)}`);
+    } catch (e) {
+      failed++;
+      console.log(`${dir}: ${(e as Error).message}`);
+    }
+  }
+  process.exit(failed ? 1 : 0);
 }
 
 /** Checks the backend settings once and returns a function giving the config for a model. */
@@ -200,6 +272,7 @@ async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === "run") await run(rest);
   else if (cmd === "evaluate") await evaluateCommand(rest);
+  else if (cmd === "upload") await uploadCommand(rest);
   else if (cmd === "--version" || cmd === "-V") console.log(VERSION);
   else {
     console.log(USAGE);

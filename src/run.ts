@@ -7,6 +7,7 @@ import * as readline from "node:readline";
 import { createModelClient, Interrupted, type ModelConfig } from "./model.js";
 import { evaluateRun, type Evaluation } from "./evaluate.js";
 import { describeFinalState, type RepoState } from "./finalstate.js";
+import { uploadRun, type HubCredentials } from "./hub.js";
 import { configureLocalCopy, describeLocalCopy, localCopyInfo, prefixCollisions, type LocalCopy } from "./localcopy.js";
 import { applyNotes, ASK_RESULT, describeAction, hasNotesDecision, NOTES_REMINDER, parseResponse, RESPONSE_SCHEMA, systemPrompt, validateAction,
   type Action } from "./protocol.js";
@@ -21,7 +22,9 @@ export const FORMAT_VERSION = 1;
 export interface RunOptions {
   task: string;
   taskName: string;
-  taskSource: { kind: "file"; path: string } | { kind: "text" };
+  taskSource: { kind: "file"; path: string } | { kind: "text" }
+    | { kind: "hub"; url: string; hub: string; id: number; title: string };
+  upload: HubCredentials | null; // upload the run to its task's hub when it ends
   model: ModelConfig;
   evaluatorModel: ModelConfig;
   sandbox: { kind: "host" } | { kind: "docker"; image: string };
@@ -234,7 +237,8 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     stop_reason: null, error: null, finished: false,
     self_reported_success: null, self_report_summary: null, self_report_friction: null, final_repos: null,
   };
-  const source = opts.taskSource.kind === "file" ? opts.taskSource.path : "given on the command line";
+  const ts = opts.taskSource;
+  const source = ts.kind === "file" ? ts.path : ts.kind === "hub" ? `${ts.title} (${ts.url})` : "given on the command line";
 
   console.log(`gentl ${opts.version}  run ${runId}`);
   console.log(`model ${opts.model.model} (${opts.model.backend})  ${sb.describe()}${opts.confirm ? "  (confirm each action)" : ""}`);
@@ -438,6 +442,15 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     if (ev) s.evaluation = { model: ev.model, success: ev.success, reasons: ev.reasons, cost_usd: ev.cost_usd };
   }
   console.log(`Run directory: ${runDir}`);
+  if (opts.upload) {
+    if (s.stop_reason === "finish" || s.stop_reason === "max_turns") {
+      try {
+        console.log(`Uploaded: ${await uploadRun(runDir, opts.upload)}`);
+      } catch (e) {
+        console.log(`Upload failed (${(e as Error).message}). Retry with: gentl upload ${path.relative(process.cwd(), runDir)}`);
+      }
+    } else console.log(`Not uploaded: the run did not finish (${s.stop_reason}).`);
+  }
   return { runDir, summary: s };
 }
 
