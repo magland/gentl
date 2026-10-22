@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { checkDocker, ensureDefaultImage } from "./docker.js";
+import { findRepo, prepareLocalCopy, removeLocalCopy, type LocalCopy } from "./localcopy.js";
+import type { ModelConfig } from "./model.js";
 import { evaluate, runTask } from "./run.js";
 import { runSuite } from "./suite.js";
 
@@ -26,8 +28,14 @@ options:
   --yes               with --host, run actions without asking
   --model M           model for the agent (default ${DEFAULT_MODEL})
   --evaluator-model M model for the evaluator (default ${DEFAULT_MODEL})
+  --backend B         openrouter (any OpenAI-compatible endpoint; key in OPENROUTER_API_KEY) or
+                      claude-code (your Claude Code login, via claude -p); default from
+                      GENTL_BACKEND, else openrouter
   --base-url URL      OpenAI-compatible endpoint (default ${DEFAULT_BASE_URL})
   --max-turns N       stop after N turns (default 50)
+  --local             serve clones of the task's repo from your checkout, uncommitted changes included
+                      (the default when the task file, suite or current directory is in a git repo)
+  --remote            clone the published repo instead
   --keep              keep the container or temp workspace instead of deleting it
 
 The API key is read from OPENROUTER_API_KEY, in the environment or in ./.env.
@@ -59,8 +67,11 @@ async function run(argv: string[]) {
       image: { type: "string" },
       confirm: { type: "boolean" },
       yes: { type: "boolean" },
+      local: { type: "boolean" },
+      remote: { type: "boolean" },
       model: { type: "string", default: DEFAULT_MODEL },
       "evaluator-model": { type: "string", default: DEFAULT_MODEL },
+      backend: { type: "string" },
       "base-url": { type: "string", default: DEFAULT_BASE_URL },
       "max-turns": { type: "string", default: "50" },
       keep: { type: "boolean" },
@@ -74,11 +85,12 @@ async function run(argv: string[]) {
   if ((values.task === undefined) === (positionals.length !== 1)) fail("give one task: a task file or -t TEXT");
   if (values.host && values.image) fail("--image applies to the Docker sandbox, not --host");
   if (values.confirm && values.yes) fail("--confirm and --yes contradict each other");
+  if (values.local && values.remote) fail("--local and --remote contradict each other");
   const confirm = values.host ? !values.yes : !!values.confirm;
   if (confirm && !process.stdin.isTTY) fail("confirming each action needs a terminal (use --yes with --host to skip it)");
   const maxTurns = Number(values["max-turns"]);
   if (!Number.isInteger(maxTurns) || maxTurns < 1) fail("--max-turns must be a positive integer");
-  const apiKey = requireApiKey();
+  const modelFor = modelConfig(values.backend, values["base-url"]!);
 
   let sandbox: { kind: "host" } | { kind: "docker"; image: string };
   if (values.host) {
@@ -92,46 +104,65 @@ async function run(argv: string[]) {
       fail((e as Error).message);
     }
   }
-  const common = { sandbox, confirm, maxTurns, keep: !!values.keep, version: VERSION,
-    model: { model: values.model!, baseUrl: values["base-url"]!, apiKey },
-    evaluatorModel: { model: values["evaluator-model"]!, baseUrl: values["base-url"]!, apiKey } };
-
-  let task: string;
-  let taskName: string;
-  let taskSource: { kind: "file"; path: string } | { kind: "text" };
+  // What to run: a suite directory, a task file, or task text.
+  let target: { kind: "suite"; dir: string } | { kind: "task"; task: string; taskName: string;
+    taskSource: { kind: "file"; path: string } | { kind: "text" } };
   if (values.task !== undefined) {
-    task = values.task.trim();
-    taskName = (task.toLowerCase().match(/[a-z0-9]+/g) ?? ["task"]).slice(0, 5).join("-");
-    taskSource = { kind: "text" };
+    const task = values.task.trim();
+    target = { kind: "task", task, taskName: (task.toLowerCase().match(/[a-z0-9]+/g) ?? ["task"]).slice(0, 5).join("-"),
+      taskSource: { kind: "text" } };
   } else {
     const p = positionals[0];
     if (/^https?:\/\//.test(p)) fail("hub tasks are not supported yet");
     if (!fs.existsSync(p)) fail(`no such file: ${p}`);
-    if (fs.statSync(p).isDirectory()) {
+    target = fs.statSync(p).isDirectory() ? { kind: "suite", dir: p }
+      : { kind: "task", task: fs.readFileSync(p, "utf8").trim(), taskName: path.basename(p).replace(/\.[^.]*$/, ""),
+        taskSource: { kind: "file", path: p } };
+  }
+  if (target.kind === "task" && !target.task) fail("the task is empty");
+
+  // The local copy: the repo containing the task file or suite (or the current directory for -t).
+  let localCopy: LocalCopy | null = null;
+  if (!values.remote) {
+    const dir = target.kind === "suite" ? target.dir : target.taskSource.kind === "file" ? path.dirname(target.taskSource.path) : ".";
+    const found = findRepo(path.resolve(dir));
+    if ("reason" in found) {
+      if (values.local) fail(`--local: ${found.reason}`);
+    } else {
       try {
-        process.exit((await runSuite(p, common)) ? 0 : 1);
+        localCopy = prepareLocalCopy(found.repo, found.origin);
       } catch (e) {
         fail((e as Error).message);
       }
     }
-    task = fs.readFileSync(p, "utf8").trim();
-    taskName = path.basename(p).replace(/\.[^.]*$/, "");
-    taskSource = { kind: "file", path: p };
   }
-  if (!task) fail("the task is empty");
 
+  const common = { sandbox, confirm, localCopy, maxTurns, keep: !!values.keep, version: VERSION,
+    model: modelFor(values.model!), evaluatorModel: modelFor(values["evaluator-model"]!) };
+  let code = 0;
   try {
-    const out = await runTask({ ...common, task, taskName, taskSource, runsDir: "runs" });
-    process.exit(out.summary.stop_reason === "error" ? 1 : 0);
+    if (target.kind === "suite") code = (await runSuite(target.dir, common)) ? 0 : 1;
+    else {
+      const out = await runTask({ ...common, task: target.task, taskName: target.taskName, taskSource: target.taskSource, runsDir: "runs" });
+      code = out.summary.stop_reason === "error" ? 1 : 0;
+    }
   } catch (e) {
-    fail((e as Error).message);
+    console.error(`gentl: ${(e as Error).message}`);
+    code = 2;
+  } finally {
+    if (localCopy) removeLocalCopy(localCopy);
   }
+  process.exit(code);
 }
 
-function requireApiKey(): string {
+/** Checks the backend settings once and returns a function giving the config for a model. */
+function modelConfig(backendOpt: string | undefined, baseUrl: string): (model: string) => ModelConfig {
+  const backend = backendOpt ?? envValue("GENTL_BACKEND") ?? "openrouter";
+  if (backend === "claude-code") return (model) => ({ backend, model, baseUrl: "", apiKey: "" });
+  if (backend !== "openrouter") fail(`unknown backend ${JSON.stringify(backend)}; use openrouter or claude-code`);
   const apiKey = envValue("OPENROUTER_API_KEY");
-  if (!apiKey) fail("OPENROUTER_API_KEY is not set (environment or ./.env)");
-  return apiKey;
+  if (!apiKey) fail("OPENROUTER_API_KEY is not set (environment or ./.env); or use --backend claude-code");
+  return (model) => ({ backend: "openrouter", model, baseUrl, apiKey });
 }
 
 async function evaluateCommand(argv: string[]) {
@@ -140,6 +171,7 @@ async function evaluateCommand(argv: string[]) {
     allowPositionals: true,
     options: {
       "evaluator-model": { type: "string", default: DEFAULT_MODEL },
+      backend: { type: "string" },
       "base-url": { type: "string", default: DEFAULT_BASE_URL },
       help: { type: "boolean", short: "h" },
     },
@@ -153,7 +185,7 @@ async function evaluateCommand(argv: string[]) {
   for (const f of ["summary.json", "events.jsonl"]) {
     if (!fs.existsSync(path.join(runDir, f))) fail(`${f} not found in ${runDir}`);
   }
-  const ok = await evaluate(runDir, { model: values["evaluator-model"]!, baseUrl: values["base-url"]!, apiKey: requireApiKey() });
+  const ok = await evaluate(runDir, modelConfig(values.backend, values["base-url"]!)(values["evaluator-model"]!));
   process.exit(ok ? 0 : 1);
 }
 

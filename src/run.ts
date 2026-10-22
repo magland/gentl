@@ -3,10 +3,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { Interrupted, ModelClient, type ModelConfig } from "./model.js";
+import { createModelClient, Interrupted, type ModelConfig } from "./model.js";
 import { evaluateRun, type Evaluation } from "./evaluate.js";
 import { describeFinalState, type RepoState } from "./finalstate.js";
-import { applyNotes, ASK_RESULT, describeAction, parseResponse, RESPONSE_SCHEMA, systemPrompt, validateAction,
+import { configureLocalCopy, describeLocalCopy, localCopyInfo, prefixCollisions, type LocalCopy } from "./localcopy.js";
+import { applyNotes, ASK_RESULT, describeAction, hasNotesDecision, NOTES_REMINDER, parseResponse, RESPONSE_SCHEMA, systemPrompt, validateAction,
   type Action } from "./protocol.js";
 import { fence } from "./format.js";
 import { ntok } from "./tokens.js";
@@ -24,6 +25,7 @@ export interface RunOptions {
   evaluatorModel: ModelConfig;
   sandbox: { kind: "host" } | { kind: "docker"; image: string };
   confirm: boolean; // ask before each action
+  localCopy: LocalCopy | null; // serve clones of this repo from the local checkout
   maxTurns: number;
   keep: boolean;
   runsDir: string; // where the run directory is created
@@ -38,11 +40,13 @@ export interface Summary {
   task_source: RunOptions["taskSource"];
   task: string;
   model: string;
-  base_url: string;
+  backend: ModelConfig["backend"];
+  base_url: string | null;
   sandbox: "host" | "docker";
   image: string | null;
   image_id: string | null;
   confirm: boolean;
+  local_copy: ReturnType<typeof localCopyInfo> | null;
   structured_output: boolean;
   started: string;
   ended: string;
@@ -63,6 +67,7 @@ export interface Summary {
   invalid_actions: number;
   repeated_actions: number;
   declined_actions: number;
+  notes_reminders: number;
   asks: { turn: number; question: string }[];
   stop_reason: "finish" | "max_turns" | "interrupted" | "error" | null;
   error: string | null;
@@ -105,7 +110,8 @@ function formatSummary(s: Summary): string {
     ["Parse errors / invalid / repeated / declined actions",
       `${s.parse_errors} / ${s.invalid_actions} / ${s.repeated_actions} / ${s.declined_actions}`],
     ["Questions asked", s.asks.length],
-    ["Cost", `$${s.cost_usd.toFixed(4)}`],
+    ["Notes reminders (responses without a notes decision)", s.notes_reminders],
+    ["Cost", `$${s.cost_usd.toFixed(4)}${s.backend === "claude-code" ? " (notional; Claude Code subscription)" : ""}`],
     ["Duration", `${Math.round(s.duration_s)} s`],
   ];
   return rows.map(([k, v]) => `- ${k}: ${v}`).join("\n") + "\n";
@@ -189,9 +195,15 @@ export interface RunOutcome {
 export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   const started = new Date();
   const runId = `${timestamp(started)}-${opts.taskName}`;
+  const lc = opts.localCopy;
+  const MIRROR_MOUNT = "/srv/git";
   const sb: Sandbox = opts.sandbox.kind === "docker"
-    ? new DockerSandbox(`gentl-${runId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}`, opts.sandbox.image)
+    ? new DockerSandbox(`gentl-${runId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}`, opts.sandbox.image,
+      lc ? [{ host: lc.mirrorDir, container: MIRROR_MOUNT }] : [])
     : new HostSandbox();
+  const localCopyError = lc
+    ? configureLocalCopy(sb, lc, sb.kind === "docker" ? `${MIRROR_MOUNT}/${lc.mirrorName}` : path.join(lc.mirrorDir, lc.mirrorName))
+    : null;
   const runDir = path.resolve(opts.runsDir, runId);
   fs.mkdirSync(runDir, { recursive: true });
   const events = fs.openSync(path.join(runDir, "events.jsonl"), "w");
@@ -204,28 +216,38 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   };
 
   const system = systemPrompt(sb.workdir, sb.kind === "docker" ? "linux" : process.platform);
-  const client = new ModelClient(opts.model, { name: "turn", schema: RESPONSE_SCHEMA }, log);
+  const client = createModelClient(opts.model, { name: "turn", schema: RESPONSE_SCHEMA }, log,
+    sb.kind === "host" ? sb.workdir : undefined);
   const s: Summary = {
     format: FORMAT_VERSION, gentl_version: opts.version, run_id: runId, task_name: opts.taskName,
-    task_source: opts.taskSource, task: opts.task, model: opts.model.model, base_url: opts.model.baseUrl,
+    task_source: opts.taskSource, task: opts.task, model: opts.model.model, backend: opts.model.backend,
+    base_url: opts.model.backend === "openrouter" ? opts.model.baseUrl : null,
     sandbox: sb.kind, image: sb instanceof DockerSandbox ? sb.image : null,
-    image_id: sb instanceof DockerSandbox ? sb.imageId : null, confirm: opts.confirm, structured_output: true, started: started.toISOString(), ended: "", duration_s: 0,
+    image_id: sb instanceof DockerSandbox ? sb.imageId : null, confirm: opts.confirm,
+    local_copy: lc && !localCopyError ? localCopyInfo(lc) : null, structured_output: true, started: started.toISOString(), ended: "", duration_s: 0,
     system_prompt: system, overhead_tokens: ntok(system) + ntok(opts.task), turns: 0,
     read_tokens_total: 0, notes_tokens_total: 0, notes_tokens_max: 0, result_tokens_total: 0, result_tokens_max: 0,
     model_output_tokens: 0, provider_prompt_tokens: 0, provider_completion_tokens: 0, cost_usd: 0,
-    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0, asks: [],
+    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0, notes_reminders: 0, asks: [],
     stop_reason: null, error: null, finished: false,
     self_reported_success: null, self_report_summary: null, self_report_friction: null, final_repos: null,
   };
   const source = opts.taskSource.kind === "file" ? opts.taskSource.path : "given on the command line";
 
   console.log(`gentl ${opts.version}  run ${runId}`);
-  console.log(`model ${opts.model.model}  ${sb.describe()}${opts.confirm ? "  (confirm each action)" : ""}`);
+  console.log(`model ${opts.model.model} (${opts.model.backend})  ${sb.describe()}${opts.confirm ? "  (confirm each action)" : ""}`);
+  if (lc && !localCopyError) {
+    console.log(`local copy: ${describeLocalCopy(lc)}`);
+    for (const u of prefixCollisions(opts.task, lc.urls)) {
+      console.log(`warning: the task mentions ${u}, which the local copy would also redirect (git insteadOf matches by prefix); use --remote if that is wrong`);
+    }
+  }
+  if (localCopyError) console.log(`warning: local copy disabled: ${localCopyError}`);
   console.log(`\nturn  +read (cumulative)  notes  action`);
-  tr(`# gentl run ${runId}\n\n- Model: ${opts.model.model}\n- Task: ${source}\n- Sandbox: ${sb.describe()}\n` +
+  tr(`# gentl run ${runId}\n\n- Model: ${opts.model.model} (${opts.model.backend})\n- Task: ${source}\n- Sandbox: ${sb.describe()}\n- Local copy: ${lc && !localCopyError ? describeLocalCopy(lc) : "none"}\n` +
     `- Started: ${started.toISOString()}\n\n## Task\n\n${opts.task}\n\n## System prompt\n\n${fence(system)}`);
   emit({ type: "start", run_id: runId, task: opts.task, task_source: opts.taskSource, model: opts.model.model,
-    base_url: opts.model.baseUrl, sandbox: sb.kind, sandbox_description: sb.describe(), workdir: sb.workdir, confirm: opts.confirm, system_prompt: system });
+    backend: opts.model.backend, base_url: s.base_url, sandbox: sb.kind, sandbox_description: sb.describe(), workdir: sb.workdir, confirm: opts.confirm, system_prompt: system });
 
   // Ctrl-C stops the running command, or cancels the model call and ends the run.
   // SIGTERM and SIGHUP end the run wherever it is; the run directory is still completed.
@@ -254,7 +276,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
       let user = `# Task\n${opts.task}\n\n# Your notes\n${notes || "(empty)"}\n`;
       if (last) user += `\n# Last action\n${last.action}\n\n# Result\n${last.result}\n`;
       const notesTok = ntok(notes);
-      const resultTok = last ? ntok(last.action) + ntok(last.result) : 0;
+      let resultTok = last ? ntok(last.action) + ntok(last.result) : 0;
       s.turns = turn;
       s.notes_tokens_total += notesTok;
       s.notes_tokens_max = Math.max(s.notes_tokens_max, notesTok);
@@ -263,29 +285,54 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
       s.read_tokens_total = s.notes_tokens_total + s.result_tokens_total;
       tr(`---\n\n## Turn ${turn}\n\nRead this turn: notes ${notesTok} + result ${resultTok} tokens (cumulative ${s.read_tokens_total})\n`);
 
-      const t0 = Date.now();
-      abortModel = new AbortController();
-      const reply = await client.call(system, user, abortModel.signal);
-      abortModel = null;
-      s.structured_output = client.structured;
-      const modelSeconds = (Date.now() - t0) / 1000;
-      const outTok = ntok(reply.text);
-      s.model_output_tokens += outTok;
-      s.provider_prompt_tokens += Number(reply.usage.prompt_tokens ?? 0);
-      s.provider_completion_tokens += Number(reply.usage.completion_tokens ?? 0);
-      s.cost_usd += Number(reply.usage.cost ?? 0);
-      tr(`_model: ${modelSeconds.toFixed(1)} s, ${outTok} output tokens_\n`);
-      const ev: Record<string, unknown> = { type: "turn", turn, input: user, response: reply.text, notes_tokens: notesTok,
-        result_tokens: resultTok, model_seconds: modelSeconds, usage: reply.usage };
-      const prefix = `t${String(turn).padStart(2, "0")}  +${resultTok + notesTok} (${s.read_tokens_total.toLocaleString("en-US")})`.padEnd(26) +
-        String(notesTok).padEnd(7);
+      const callModel = async (input: string) => {
+        const t0 = Date.now();
+        abortModel = new AbortController();
+        const reply = await client.call(system, input, abortModel.signal);
+        abortModel = null;
+        s.structured_output = client.structured;
+        const outTok = ntok(reply.text);
+        s.model_output_tokens += outTok;
+        s.provider_prompt_tokens += Number(reply.usage.prompt_tokens ?? 0);
+        s.provider_completion_tokens += Number(reply.usage.completion_tokens ?? 0);
+        s.cost_usd += Number(reply.usage.cost ?? 0);
+        const seconds = (Date.now() - t0) / 1000;
+        tr(`_model: ${seconds.toFixed(1)} s, ${outTok} output tokens_\n`);
+        return { reply, seconds };
+      };
+      const tryParse = (text: string) => {
+        try {
+          return { parsed: parseResponse(text), error: null };
+        } catch (e) {
+          return { parsed: null, error: (e as Error).message };
+        }
+      };
 
-      let parsed;
-      try {
-        parsed = parseResponse(reply.text);
-      } catch (e) {
+      let { reply, seconds: modelSeconds } = await callModel(user);
+      let { parsed, error: parseError } = tryParse(reply.text);
+      const ev: Record<string, unknown> = { type: "turn", turn, input: user, notes_tokens: notesTok, usage: reply.usage };
+      // No notes decision: ask again within the turn, while the result is still in view. The reminder counts as read.
+      if (parsed && !hasNotesDecision(parsed)) {
+        s.notes_reminders++;
+        const reminderTok = ntok(NOTES_REMINDER);
+        resultTok += reminderTok;
+        s.result_tokens_total += reminderTok;
+        s.result_tokens_max = Math.max(s.result_tokens_max, resultTok);
+        s.read_tokens_total = s.notes_tokens_total + s.result_tokens_total;
+        tr(`### No notes decision; reminder sent (${reminderTok} tokens)\n\nFirst response:\n${fence(reply.text)}`);
+        Object.assign(ev, { response_without_notes: reply.text, usage_without_notes: reply.usage });
+        const retryInput = `${user}\n# Reminder\n${NOTES_REMINDER}\n`;
+        ({ reply, seconds: modelSeconds } = await callModel(retryInput));
+        ({ parsed, error: parseError } = tryParse(reply.text));
+        Object.assign(ev, { input: retryInput, usage: reply.usage, notes_reminder: true });
+      }
+      Object.assign(ev, { response: reply.text, result_tokens: resultTok, model_seconds: modelSeconds });
+      const prefix = `t${String(turn).padStart(2, "0")}  +${resultTok + notesTok} (${s.read_tokens_total.toLocaleString("en-US")})`.padEnd(26) +
+        String(notesTok).padEnd(7) + (ev.notes_reminder ? "[reminded] " : "");
+
+      if (!parsed) {
         s.parse_errors++;
-        const msg = (e as Error).message;
+        const msg = parseError!;
         console.log(`${prefix}parse error: ${msg}`);
         tr(`### Parse error: ${msg}\n\nRaw response:\n${fence(reply.text)}`);
         last = { action: "(none: your response could not be parsed)",
@@ -299,7 +346,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
       const a = parsed.action;
       const line = actionLine(a);
       console.log(prefix + line);
-      tr(`### Notes (${n.ops.length ? n.ops.join(", ") : "unchanged"}; ${ntok(notes)} tokens)\n\n${fence(notes || "(empty)")}`);
+      tr(`### Notes (${n.ops.length ? n.ops.join(", ") : parsed.notes_keep === true ? "kept" : "unchanged"}; ${ntok(notes)} tokens)\n\n${fence(notes || "(empty)")}`);
       for (const f of n.feedback) tr(`_${f}_\n`);
       tr(formatAction(a));
       Object.assign(ev, { parsed, notes, notes_ops: n.ops, notes_feedback: n.feedback });

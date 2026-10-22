@@ -17,7 +17,7 @@ npm install
 npm link        # puts `gentl` on your PATH
 ```
 
-Set `OPENROUTER_API_KEY` in the environment or in a `.env` file in the directory you run from.
+For the default backend, set `OPENROUTER_API_KEY` in the environment or in a `.env` file in the directory you run from. To use your Claude Code subscription instead, pass `--backend claude-code` (or set `GENTL_BACKEND=claude-code`); see Backends.
 
 ## Usage
 
@@ -37,9 +37,23 @@ Options:
 - `--yes`: with `--host`, run actions without asking.
 - `--model M`: the agent's model, default `anthropic/claude-haiku-5.5`.
 - `--evaluator-model M`: the evaluator's model, same default.
+- `--backend B`: `openrouter` (default) or `claude-code`; see Backends.
+- `--local` / `--remote`: serve clones of the task's repo from your checkout (the default inside a git repo), or clone the published repo; see Local copy.
 - `--base-url URL`: any OpenAI-compatible endpoint (default `https://openrouter.ai/api/v1`). The key in `OPENROUTER_API_KEY` is sent to it.
 - `--max-turns N`: default 50.
 - `--keep`: keep the container or temp workspace instead of deleting it.
+
+### Local copy
+
+When the task file (or suite directory, or the current directory for `-t`) is inside a git repo with an `origin` remote, gentl serves clones of that origin from your checkout, including uncommitted changes. So you can edit the docs and rerun without pushing. At startup gentl makes a temporary bare mirror of your checkout; uncommitted changes (tracked and untracked, not ignored) become one extra commit, "Work in progress", under your git identity, on top of your current branch. Your own repo, index and working tree are not touched. The sandbox's git config then redirects the origin URL (in its https, http, `git@host:` and `ssh://` forms, with and without `.git`) to the mirror with `url.<mirror>.insteadOf`, so the agent runs the `git clone` the task names. In Docker the mirror is mounted read-only at `/srv/git`. A suite uses one mirror for all its tasks. gentl prints the local copy at the start, and records it in `summary.json` (`local_copy`); the evaluator is told about it.
+
+`--remote` turns this off; `--local` makes it an error if there is no repo to serve. Hub tasks (later) will always clone the published repo.
+
+Limits:
+
+- Pages the agent reads on GitHub through w3m or curl still show the pushed version, and a task that pins a tag or commit gets that version, not your edits.
+- `git remote -v` in the agent's clone shows the mirror's `file://` URL, so an agent that looks can tell.
+- git's `insteadOf` matches by prefix, so `https://github.com/owner/foo` also catches `https://github.com/owner/foo-extra`. gentl warns when the task text mentions such a URL.
 
 ### Docker (default)
 
@@ -66,10 +80,10 @@ Each suite should include a baseline task ("clone, install, run the tests"). Its
 Each turn the model sees only the system prompt, the task, its notes, and its last action with the result (shown once). It returns one JSON object:
 
 ```
-{"notes": "...", "notes_edit": {"old": "...", "new": "..."}, "notes_append": "...", "action": {...}}
+{"notes_keep": false, "notes": "...", "notes_edit": {"old": "...", "new": "..."}, "notes_append": "...", "action": {...}}
 ```
 
-Only `action` is required. The notes are the agent's working memory, meant to mimic how much a person can hold in their head at once, so the agent is asked to keep them small. The notes operations are applied in order (rewrite, edit, append); leaving them out keeps the notes unchanged.
+The notes are the agent's working memory, meant to mimic how much a person can hold in their head at once, so the agent is asked to keep them small. `notes_keep` and `action` are required. Each turn the agent either updates its notes (`notes_keep: false` with one or more of the operations, applied in order: rewrite, edit, append) or keeps them as they are (`notes_keep: true`). Making the choice explicit matters: without it, models often wrote the action first and skipped the notes, then forgot what they had learned. If a response makes no notes decision anyway, gentl asks again within the same turn, once, with a short reminder (counted as reading and recorded as `notes_reminders`).
 
 Actions:
 
@@ -78,7 +92,14 @@ Actions:
 - `ask {question}`: no one answers. The question is recorded as a gap in the docs, and the agent is told to decide from the docs and code.
 - `finish {success, summary, friction?}`: the summary cites the evidence of success; `friction` is the agent's own account of what was missing or unclear in the docs.
 
-With OpenRouter, gentl asks for structured output (a JSON schema) so responses parse reliably; if the endpoint rejects it, gentl falls back to plain text and parses the first JSON object that contains an `action`.
+gentl asks for structured output (a JSON schema) so responses parse reliably; if the backend rejects it, gentl falls back to plain text and parses the first JSON object that contains an `action`.
+
+## Backends
+
+- `openrouter` (default): any OpenAI-compatible chat completions endpoint, OpenRouter unless `--base-url` says otherwise, with the key in `OPENROUTER_API_KEY`. Each turn is one request with the system prompt and one user message.
+- `claude-code`: your Claude Code login, through a fresh `claude -p` process per call, with no tools, no settings files (so no CLAUDE.md, memory, hooks or plugins), no MCP servers and no saved session. Model ids like `anthropic/claude-haiku-5.5` are mapped to `claude-haiku-5-5`. Claude Code still adds a short preamble and an environment block (cwd, platform, date) to the system prompt, about 740 tokens; `--bare` would remove them but works only with an API key. Effort is Claude Code's default unless `GENTL_CLAUDE_EFFORT` is set. Reported cost is notional. The model call runs on your machine; the sandbox (Docker or host) is unaffected.
+
+The backend is recorded in `summary.json`. Runs with different backends are not directly comparable.
 
 ## Evaluation
 

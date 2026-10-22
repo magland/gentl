@@ -6,6 +6,7 @@ export interface AgentResponse {
   notes?: unknown;
   notes_edit?: unknown;
   notes_append?: unknown;
+  notes_keep?: unknown;
   action: Action;
 }
 
@@ -23,11 +24,13 @@ Treat the software as unfamiliar. Go by its docs and code, not by what you remem
 
 This is a test of how readable the software and its docs are. We count the tokens you read (every result you see, plus your notes each turn) as a proxy for the effort a human newcomer would need, and we collect what was missing or unclear. So read in a targeted way (grep, sed -n, head, --help) rather than dumping whole files or long pages. When the docs and code don't answer something you need, don't keep searching or guess silently: use the ask action, then make a reasonable decision and move on. A gap in the docs is useful feedback, not a failure on your part.
 
-You have no memory between turns. Each turn you see only the task, your notes, and your last action with its result (shown once). Your notes are your working memory, like what a person can hold in their head at once: keep them small, with only what you still need (key facts, where things are, what is done, what is next). They are counted every turn.
+You have no memory between turns. Each turn you see only the task, your notes, and your last action with its result. The result is shown once and is gone on the next turn; your notes are all you carry forward. They are your working memory, like what a person can hold in their head at once. They start empty.
+
+So every turn has two steps. First, update your notes: if the result (or the task, on the first turn) tells you something you will need later, such as a fact, a path, a command that worked, what is done or what is next, record it and set "notes_keep": false. Only if nothing is worth keeping, set "notes_keep": true. Second, choose the action. Keep the notes small, with only what you still need; they are counted every turn.
 
 Each turn, respond with one JSON object and nothing else:
-{"notes": "...", "notes_edit": {"old": "...", "new": "..."}, "notes_append": "...", "action": {...}}
-Only "action" is required. "notes" replaces your notes, "notes_edit" replaces text that occurs exactly once in them, and "notes_append" adds a line at the end; they are applied in that order. Leave all three out to keep your notes unchanged.
+{"notes_keep": false, "notes": "...", "notes_edit": {"old": "...", "new": "..."}, "notes_append": "...", "action": {...}}
+"notes_keep" and "action" are required. With "notes_keep": false, give at least one of "notes" (replaces your notes), "notes_edit" (replaces text that occurs exactly once in them) and "notes_append" (adds a line at the end); they are applied in that order. "notes_keep": true leaves your notes as they are.
 
 Actions:
 - {"type": "run", "cmd": "..."}: run with bash in your working directory. Each command starts a fresh shell (cd and exported variables do not persist) with no input. stdout and stderr are combined; output longer than ${DEFAULT_MAX_CHARS} characters is cut in the middle (add "max_chars": N, at most ${MAX_MAX_CHARS}, to see more). Timeout ${CMD_TIMEOUT_S} s.
@@ -46,6 +49,7 @@ const obj = (properties: Record<string, unknown>, required: string[]) =>
 const str = { type: "string" };
 const actionType = (t: string) => ({ type: "string", enum: [t] });
 export const RESPONSE_SCHEMA = obj({
+  notes_keep: { type: "boolean" },
   notes: str,
   notes_edit: obj({ old: str, new: str }, ["old", "new"]),
   notes_append: str,
@@ -58,7 +62,7 @@ export const RESPONSE_SCHEMA = obj({
       obj({ type: actionType("finish"), success: { type: "boolean" }, summary: str, friction: str }, ["type", "success", "summary"]),
     ],
   },
-}, ["action"]);
+}, ["notes_keep", "action"]);
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -108,6 +112,14 @@ export function parseResponse(text: string): AgentResponse {
 export function countOccurrences(text: string, sub: string): number {
   return sub === "" ? 0 : text.split(sub).length - 1;
 }
+
+/** Whether the response makes a notes decision: an operation, or "notes_keep": true. */
+export function hasNotesDecision(r: AgentResponse): boolean {
+  return r.notes !== undefined || r.notes_edit !== undefined || r.notes_append !== undefined || r.notes_keep === true;
+}
+
+/** The reminder sent, within the same turn, when a response has no notes decision. */
+export const NOTES_REMINDER = 'Your response did not update your notes or set "notes_keep": true. The result above will be gone on the next turn. Respond again with your notes update ("notes", "notes_edit" or "notes_append"), or "notes_keep": true if nothing is worth keeping, together with your action.';
 
 /** Apply the notes operations in order (rewrite, edit, append). Problems are returned as feedback for the agent. */
 export function applyNotes(notes: string, r: AgentResponse): { notes: string; ops: string[]; feedback: string[] } {

@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { clip, fence } from "./format.js";
-import { ModelClient, type ModelConfig } from "./model.js";
+import { createModelClient, type ModelConfig } from "./model.js";
 import { parseFirstJson } from "./protocol.js";
 
 const RESULT_HIDDEN_CAP = 6000; // chars of the part of a result the agent did not see
@@ -108,7 +108,10 @@ export function buildEvaluatorInput(runDir: string): string {
   const finish = summary.finished
     ? `success: ${summary.self_reported_success}\nsummary: ${summary.self_report_summary}\nfriction: ${summary.self_report_friction ?? "(none given)"}`
     : `The agent did not finish (stop reason: ${summary.stop_reason}).`;
-  return `# Task\n\n${summary.task}\n\n# Run\n\nModel ${summary.model}, sandbox ${summary.sandbox}, ${summary.turns} turns, stop reason ${summary.stop_reason}.\n\n` +
+  const lc = summary.local_copy
+    ? ` Clones of ${summary.local_copy.origin} were served from the maintainer's local working copy (with any uncommitted changes), so the agent's clone may differ from the published repo and its origin URL is a local file:// path; this is intended, not a problem with the run.`
+    : "";
+  return `# Task\n\n${summary.task}\n\n# Run\n\nModel ${summary.model}, sandbox ${summary.sandbox}, ${summary.turns} turns, stop reason ${summary.stop_reason}.${lc}\n\n` +
     `# Log\n\n${log}\n# Questions the agent asked\n\n${asks.length ? asks.map((a) => `- turn ${a.turn}: ${a.question}`).join("\n") : "none"}\n\n` +
     `# The agent's finish report\n\n${finish}\n\n# Final state of the workspace\n\n${finalState}\n`;
 }
@@ -117,7 +120,7 @@ export function buildEvaluatorInput(runDir: string): string {
 export async function evaluateRun(runDir: string, cfg: ModelConfig, signal: AbortSignal,
   log: (msg: string) => void): Promise<Evaluation> {
   const input = buildEvaluatorInput(runDir);
-  const client = new ModelClient(cfg, EVAL_SCHEMA, log);
+  const client = createModelClient(cfg, EVAL_SCHEMA, log);
   const reply = await client.call(EVALUATOR_PROMPT, input, signal);
   let parsed: any;
   try {

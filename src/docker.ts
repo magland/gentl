@@ -34,9 +34,11 @@ export class DockerSandbox extends Sandbox {
   readonly imageId: string;
   private count = 0;
 
-  constructor(readonly name: string, readonly image: string) {
+  /** `mounts` are read-only bind mounts (host directory to container directory). */
+  constructor(readonly name: string, readonly image: string, mounts: { host: string; container: string }[] = []) {
     super();
-    const r = docker(["run", "-d", "--init", "--name", name, "-w", WORKDIR, "--entrypoint", "sleep", image, "infinity"]);
+    const volumes = mounts.flatMap((m) => ["-v", `${m.host}:${m.container}:ro`]);
+    const r = docker(["run", "-d", "--init", "--name", name, "-w", WORKDIR, ...volumes, "--entrypoint", "sleep", image, "infinity"]);
     if (!r.ok) throw new Error(`could not start container from ${image}: ${r.out.trim()}`);
     this.imageId = docker(["image", "inspect", "-f", "{{.Id}}", image]).out.trim();
   }

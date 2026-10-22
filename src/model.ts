@@ -1,9 +1,28 @@
-// Calls to an OpenAI-compatible chat completions endpoint (OpenRouter by default).
+// Model backends. "openrouter": an OpenAI-compatible chat completions endpoint (OpenRouter by default).
+// "claude-code": the user's Claude Code login, through `claude -p` (see claude.ts).
+
+import { ClaudeCodeClient } from "./claude.js";
 
 export interface ModelConfig {
+  backend: "openrouter" | "claude-code";
   model: string;
-  baseUrl: string;
-  apiKey: string;
+  baseUrl: string; // openrouter only
+  apiKey: string; // openrouter only
+}
+
+/** One stateless call: system prompt plus one user message in, text out. */
+export interface ModelClient {
+  /** Whether responses are requested as structured JSON; turned off if the backend rejects it. */
+  structured: boolean;
+  call(system: string, user: string, signal: AbortSignal): Promise<ModelReply>;
+}
+
+export type ResponseSchema = { name: string; schema: object };
+
+/** `cwd` is where a claude-code call runs; ideally a directory that matches the agent's working directory. */
+export function createModelClient(cfg: ModelConfig, schema: ResponseSchema, log: (msg: string) => void,
+  cwd?: string): ModelClient {
+  return cfg.backend === "claude-code" ? new ClaudeCodeClient(cfg.model, schema, log, cwd) : new OpenAIClient(cfg, schema, log);
 }
 
 export interface ModelReply {
@@ -17,16 +36,27 @@ export class Interrupted extends Error {
   }
 }
 
-const RETRY_DELAYS_S = [2, 5, 15];
+export const RETRY_DELAYS_S = [2, 5, 15];
 
-export class ModelClient {
-  /** Whether responses are requested as structured JSON; turned off if the endpoint rejects it. */
+/** Wait before a retry; Ctrl-C ends the wait. */
+export async function retryWait(attempt: number, why: string, signal: AbortSignal, log: (msg: string) => void) {
+  const s = RETRY_DELAYS_S[attempt];
+  log(`${why}; retrying in ${s} s`);
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(resolve, s * 1000);
+    signal.addEventListener("abort", () => {
+      clearTimeout(t);
+      reject(new Interrupted());
+    }, { once: true });
+  });
+}
+
+class OpenAIClient implements ModelClient {
   structured = true;
   private openrouter: boolean;
 
   /** `schema` is the JSON schema requested for responses (structured output). */
-  constructor(private cfg: ModelConfig, private schema: { name: string; schema: object },
-    private log: (msg: string) => void) {
+  constructor(private cfg: ModelConfig, private schema: ResponseSchema, private log: (msg: string) => void) {
     this.openrouter = cfg.baseUrl.includes("openrouter.ai");
   }
 
@@ -43,7 +73,7 @@ export class ModelClient {
       } catch (e) {
         if (signal.aborted) throw new Interrupted();
         if (attempt >= RETRY_DELAYS_S.length) throw new Error(`model call failed: ${(e as Error).message}`);
-        await this.wait(attempt, `network error: ${(e as Error).message}`, signal);
+        await retryWait(attempt, `network error: ${(e as Error).message}`, signal, this.log);
         continue;
       }
       const raw = await r.text().catch(() => "");
@@ -63,7 +93,7 @@ export class ModelClient {
           continue;
         }
         if (attempt >= RETRY_DELAYS_S.length) throw new Error(`model call failed: ${JSON.stringify(d.error ?? d).slice(0, 500)}`);
-        await this.wait(attempt, `error in response: ${JSON.stringify(d.error ?? d).slice(0, 200)}`, signal);
+        await retryWait(attempt, `error in response: ${JSON.stringify(d.error ?? d).slice(0, 200)}`, signal, this.log);
         continue;
       }
       if (this.structured && [400, 404, 422].includes(r.status)) {
@@ -73,7 +103,7 @@ export class ModelClient {
       }
       const retryable = r.status === 429 || r.status >= 500;
       if (!retryable || attempt >= RETRY_DELAYS_S.length) throw new Error(`model call failed: HTTP ${r.status} ${raw.slice(0, 500)}`);
-      await this.wait(attempt, `HTTP ${r.status}`, signal);
+      await retryWait(attempt, `HTTP ${r.status}`, signal, this.log);
     }
   }
 
@@ -99,15 +129,4 @@ export class ModelClient {
     return body;
   }
 
-  private async wait(attempt: number, why: string, signal: AbortSignal) {
-    const s = RETRY_DELAYS_S[attempt];
-    this.log(`${why}; retrying in ${s} s`);
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(resolve, s * 1000);
-      signal.addEventListener("abort", () => {
-        clearTimeout(t);
-        reject(new Interrupted());
-      }, { once: true });
-    });
-  }
 }
