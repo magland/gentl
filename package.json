@@ -3,6 +3,23 @@
   "version": "0.1.0",
   "description": "A readability test for codebases: a memoryless agent carries out a newcomer task and gentl measures how much it had to read.",
   "license": "Apache-2.0",
+  "author": "Jeremy Magland",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magland/gentl.git"
+  },
+  "homepage": "https://github.com/magland/gentl#readme",
+  "bugs": {
+    "url": "https://github.com/magland/gentl/issues"
+  },
+  "keywords": [
+    "documentation",
+    "readability",
+    "onboarding",
+    "agent",
+    "llm",
+    "evaluation"
+  ],
   "type": "module",
   "bin": {
     "gentl": "dist/cli.js"
@@ -15,8 +32,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc",
-    "prepare": "tsc"
+    "build": "node -e \"require('fs').rmSync('dist', {recursive: true, force: true})\" && tsc",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "js-tiktoken": "^1.0.21"

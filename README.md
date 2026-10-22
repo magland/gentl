@@ -11,11 +11,10 @@ Status: early.
 Requires Node >= 20 and Docker (or use `--host`).
 
 ```
-git clone https://github.com/magland/gentl
-cd gentl
-npm install
-npm link        # puts `gentl` on your PATH
+npm install -g @magland/gentl
 ```
+
+From source: `git clone https://github.com/magland/gentl && cd gentl && npm install && npm link`.
 
 For the default backend, set `OPENROUTER_API_KEY` in the environment or in a `.env` file in the directory you run from. To use your Claude Code subscription instead, pass `--backend claude-code` (or set `GENTL_BACKEND=claude-code`); see Backends.
 
