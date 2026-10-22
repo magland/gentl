@@ -2,7 +2,7 @@
 // edits files, and runs short commands for gentl itself (e.g. to record the final state).
 
 import { spawnSync, type ChildProcess } from "node:child_process";
-import { CMD_TIMEOUT_S, countOccurrences, DEFAULT_MAX_CHARS, MAX_MAX_CHARS } from "./protocol.js";
+import { CMD_TIMEOUT_S, countOccurrences, DEFAULT_MAX_CHARS, MAX_MAX_CHARS, READ_MAX_CHARS } from "./protocol.js";
 
 const CAPTURE_HEAD = 1 << 20; // bytes of output kept from the start of a command
 const CAPTURE_TAIL = 1 << 20; // and from the end
@@ -117,8 +117,9 @@ export abstract class Sandbox {
         const classified = started.sandboxStderr?.(sandboxStderr) ?? { keep: "", fatal: null };
         if (classified.keep) cap.add(Buffer.from(classified.keep));
         const out = cap.text();
-        const status = cur.interrupted ? "stopped by the person running gentl (Ctrl-C)"
+        let status = cur.interrupted ? "stopped by the person running gentl (Ctrl-C)"
           : timedOut ? `timed out after ${CMD_TIMEOUT_S} s` : code !== null ? `exit code ${code}` : `killed by ${signal}`;
+        if (out.length > maxChars) status += `; output cut in the middle (${out.length - Math.floor((maxChars * 3) / 5) - Math.floor((maxChars * 2) / 5)} of ${out.length} chars left out)`;
         const truncation = out.length > maxChars
           ? { head: status.length + 1 + Math.floor((maxChars * 3) / 5), tail: Math.floor((maxChars * 2) / 5) } : null;
         resolve({ exitCode: code, signal, full: `${status}\n${out}`, shown: `${status}\n${truncate(out, maxChars)}`,
@@ -152,14 +153,67 @@ export abstract class Sandbox {
     return r.ok ? `wrote ${p}` : `error: ${r.out.trim()}`;
   }
 
+  /** Lines `start` to `end` of a file, numbered; never cut in the middle, stopped at a line boundary if too long. */
+  readFile(p: string, start?: number, end?: number): string {
+    const r = this.exec(["cat", "--", p]);
+    if (!r.ok) return `error: ${r.out.trim()}`;
+    if (r.out.includes("\0")) return `error: ${p} is a binary file`;
+    const lines = r.out.split("\n");
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    const total = lines.length;
+    const from = Math.max(1, start ?? 1);
+    const to = Math.min(total, end ?? total);
+    if (from > total) return `${p} has ${total} lines; nothing at line ${from}`;
+    const width = String(to).length;
+    let body = "";
+    let last = from - 1;
+    for (let i = from; i <= to; i++) {
+      const line = `${String(i).padStart(width)}  ${lines[i - 1]}\n`;
+      if (body.length + line.length > READ_MAX_CHARS && i > from) break;
+      body += line;
+      last = i;
+    }
+    const head = `${p}: lines ${from}-${last} of ${total}`;
+    const more = last < to ? `\n[stopped at line ${last} to stay under ${READ_MAX_CHARS} chars; read on with "start_line": ${last + 1}]` : "";
+    return `${head}\n${body}${more}`;
+  }
+
   editFile(p: string, old: string, replacement: string): string {
     const r = this.exec(["cat", "--", p]);
     if (!r.ok) return `error: ${r.out.trim()}`;
     const n = countOccurrences(r.out, old);
-    if (n !== 1) return `error: the old text occurs ${n} times in ${p}; it must occur exactly once`;
+    if (n > 1) return `error: the old text occurs ${n} times in ${p}; it must occur exactly once (include more of the surrounding lines)`;
+    if (n === 0) return `error: the old text occurs 0 times in ${p}; it must occur exactly once${editHint(r.out, old)}`;
     const w = this.exec(["sh", "-c", 'cat > "$1"', "sh", p], undefined, r.out.replace(old, () => replacement));
     return w.ok ? `edited ${p}` : `error: ${w.out.trim()}`;
   }
+}
+
+/**
+ * Why an edit's old text may not have matched, for the error message: the commonest cause is a backslash
+ * sequence in the code (a \\n inside a string) written in JSON as a real line break or tab; otherwise the
+ * file's lines that come closest to the old text's first line, so the agent can copy them exactly.
+ */
+export function editHint(text: string, old: string): string {
+  const unescaped = old.replace(/\n/g, "\\n").replace(/\t/g, "\\t");
+  for (const candidate of [old.replace(/\t/g, "\\t"), unescaped]) {
+    if (candidate !== old && countOccurrences(text, candidate) === 1) {
+      return ". It would match if a line break or tab inside the old text were the two characters \\n or \\t, as the file has them: in JSON, write a backslash in the code as \\\\ (\\n in the code is \"\\\\n\")";
+    }
+  }
+  const first = old.split("\n").map((l) => l.trim()).find((l) => l.length >= 3);
+  if (!first) return "";
+  const lines = text.split("\n");
+  const words = first.split(/\W+/).filter((w) => w.length >= 3);
+  const scored = lines.map((l, i) => {
+    const t = l.trim();
+    const score = t === first ? 1000 : t.includes(first) ? 500 : words.filter((w) => t.includes(w)).length;
+    return { i, l, score };
+  }).filter((x) => x.score > 0 && (x.score >= 500 || x.score >= Math.max(2, Math.ceil(words.length / 2))));
+  scored.sort((a, b) => b.score - a.score || a.i - b.i);
+  if (!scored.length) return "";
+  const shown = scored.slice(0, 3).sort((a, b) => a.i - b.i).map((x) => `${x.i + 1}: ${x.l}`).join("\n");
+  return `. The file's lines closest to the old text's first line (copy the old text exactly, including indentation; read_file shows the lines around them):\n${shown}`;
 }
 
 /** spawnSync wrapper returning stdout (plus stderr on failure). */

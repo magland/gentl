@@ -87,6 +87,8 @@ function formatAction(a: Action): string {
   switch (a.type) {
     case "run":
       return `### Action: run${a.max_chars !== undefined ? ` (max_chars ${a.max_chars})` : ""}\n${fence(String(a.cmd), "bash")}`;
+    case "read_file":
+      return `### Action: read_file \`${a.path}\`${a.start_line !== undefined || a.end_line !== undefined ? ` lines ${a.start_line ?? 1}-${a.end_line ?? "end"}` : ""}\n`;
     case "write_file":
       return `### Action: write_file \`${a.path}\`\n${fence(String(a.content))}`;
     case "edit_file":
@@ -174,6 +176,8 @@ function actionLine(a: Action): string {
   switch (a.type) {
     case "run":
       return `run: ${firstLine(String(a.cmd), 90)}`;
+    case "read_file":
+      return `read_file: ${a.path}${a.start_line !== undefined || a.end_line !== undefined ? ` ${a.start_line ?? 1}-${a.end_line ?? "end"}` : ""}`;
     case "write_file":
     case "edit_file":
       return `${a.type}: ${a.path}`;
@@ -282,7 +286,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
 
   let notes = "";
   let last: { action: string; result: string } | null = null;
-  let lastActionJson: string | null = null;
+  const seen = new Map<string, number[]>(); // action key -> turns it was taken
   try {
     for (let turn = 1; turn <= opts.maxTurns; turn++) {
       if (stopRequested) throw new Interrupted();
@@ -372,13 +376,16 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
         break;
       }
 
+      // An action the agent already took, at any earlier turn, is pointed out: rereading the same thing in a
+      // cycle is the commonest way a memoryless agent gets stuck.
       const notices: string[] = [];
-      const actionJson = JSON.stringify(a);
-      if (actionJson === lastActionJson) {
+      const key = a.type === "run" ? `run ${String(a.cmd).replace(/\s+/g, " ").trim()}` : JSON.stringify(a);
+      const earlier = seen.get(key) ?? [];
+      if (earlier.length) {
         s.repeated_actions++;
-        notices.push("note: this action is identical to your previous one.");
+        notices.push(`note: you already ran this exact ${a.type === "run" ? "command" : "action"} at turn${earlier.length > 1 ? "s" : ""} ${earlier.join(", ")}. If you are rereading, act on what your notes hold, or record what you need from it this time.`);
       }
-      lastActionJson = actionJson;
+      seen.set(key, [...earlier, turn]);
 
       let full: string;
       let shown: string;
@@ -400,6 +407,8 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
           ({ full, shown } = r);
           Object.assign(ev, { truncation: r.truncation ?? undefined, exit_code: r.exitCode, signal: r.signal, cmd_seconds: r.seconds, timed_out: r.timedOut,
             interrupted: r.interrupted });
+        } else if (a.type === "read_file") {
+          full = shown = sb.readFile(String(a.path), a.start_line as number | undefined, a.end_line as number | undefined);
         } else if (a.type === "write_file") {
           full = shown = sb.writeFile(String(a.path), String(a.content));
         } else {

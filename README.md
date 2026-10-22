@@ -92,10 +92,13 @@ Each turn the model sees only the system prompt, the task, its notes, and its la
 
 The notes are the agent's working memory, meant to mimic how much a person can hold in their head at once, so the agent is asked to keep them small. `notes_keep` and `action` are required. Each turn the agent either updates its notes (`notes_keep: false` with one or more of the operations, applied in order: rewrite, edit, append) or keeps them as they are (`notes_keep: true`). Making the choice explicit matters: without it, models often wrote the action first and skipped the notes, then forgot what they had learned. If a response makes no notes decision anyway, gentl asks again within the same turn, once, with a short reminder (counted as reading and recorded as `notes_reminders`).
 
+A memoryless agent can also go in circles, rereading the same sections because nothing tells it it has read them. Two things work against that. The prompt asks the agent to keep a short log in its notes of what it has read and what it gave, to check it before reading, and to act on a result in the turn it sees it (for code: read the whole region to change at once, then edit) rather than collecting a file piece by piece. And when the agent repeats an action it already took at any earlier turn, the result says so, naming those turns (counted as reading; `repeated_actions` in the summary).
+
 Actions:
 
-- `run {cmd, max_chars?}`: bash in the working directory. stdout and stderr are combined. Output longer than `max_chars` (default 2000, at most 20000) is cut in the middle, keeping the head and tail.
-- `write_file {path, content}` and `edit_file {path, old, new}` (`old` must occur exactly once).
+- `run {cmd, max_chars?}`: bash in the working directory. stdout and stderr are combined. Output longer than `max_chars` (default 2000, at most 20000) is cut in the middle, keeping the head and tail, and the result's first line says so.
+- `read_file {path, start_line?, end_line?}`: exactly the requested lines of a file, numbered, never cut in the middle; a range over 20000 characters stops at a line boundary and says where to go on. The prompt asks the agent to read files this way rather than with `cat` or `sed`, whose output, like any command's, is cut in the middle when long. Without it, an agent reading part of a file would get both ends of the range and not the middle, ask for the middle, lose the rest, and go round in circles.
+- `write_file {path, content}` and `edit_file {path, old, new}` (`old` must occur exactly once). When `old` does not match, the error says why if it can: a backslash sequence in the code (`\n` in a string) written in the JSON as a real line break, or else the file's lines closest to it.
 - `ask {question}`: no one answers. The question is recorded as a gap in the docs, and the agent is told to decide from the docs and code.
 - `finish {success, summary, friction?}`: the summary cites the evidence of success; `friction` is the agent's own account of what was missing or unclear in the docs.
 

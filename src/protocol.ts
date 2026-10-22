@@ -10,7 +10,8 @@ export interface AgentResponse {
   action: Action;
 }
 
-export const ACTION_TYPES = ["run", "write_file", "edit_file", "ask", "finish"];
+export const ACTION_TYPES = ["run", "read_file", "write_file", "edit_file", "ask", "finish"];
+export const READ_MAX_CHARS = 20000; // a read_file result stops at a line boundary before this
 
 export const ASK_RESULT = "No one is available to answer. Your question is recorded as a gap in the docs. Decide from the docs and code as best you can.";
 export const DEFAULT_MAX_CHARS = 2000;
@@ -28,12 +29,15 @@ You have no memory between turns. Each turn you see only the task, your notes, a
 
 So every turn has two steps. First, update your notes: if the result (or the task, on the first turn) tells you something you will need later, such as a fact, a path, a command that worked, what is done or what is next, record it and set "notes_keep": false. Only if nothing is worth keeping, set "notes_keep": true. Second, choose the action. Keep the notes small, with only what you still need; they are counted every turn.
 
+Your notes are also how you avoid going in circles. Keep a short log in them of what you have read (a file and line range, a doc section, a command) and what it gave you, or "nothing needed", and check it before reading anything: read something again only if you need a detail you did not record, and then record it. You cannot hold a whole file in your notes, so don't collect one piece by piece. Instead, act on a result in the turn you see it: to change code, read the whole region you need at once (raise max_chars if it is long) and make the edit in your response to that result, copying the exact text to replace from it. Drop log entries once they no longer matter.
+
 Each turn, respond with one JSON object and nothing else:
 {"notes_keep": false, "notes": "...", "notes_edit": {"old": "...", "new": "..."}, "notes_append": "...", "action": {...}}
 "notes_keep" and "action" are required. With "notes_keep": false, give at least one of "notes" (replaces your notes), "notes_edit" (replaces text that occurs exactly once in them) and "notes_append" (adds a line at the end); they are applied in that order. "notes_keep": true leaves your notes as they are.
 
 Actions:
-- {"type": "run", "cmd": "..."}: run with bash in your working directory. Each command starts a fresh shell (cd and exported variables do not persist) with no input. stdout and stderr are combined; output longer than ${DEFAULT_MAX_CHARS} characters is cut in the middle (add "max_chars": N, at most ${MAX_MAX_CHARS}, to see more). Timeout ${CMD_TIMEOUT_S} s.
+- {"type": "run", "cmd": "..."}: run with bash in your working directory. Each command starts a fresh shell (cd and exported variables do not persist) with no input. stdout and stderr are combined; output longer than ${DEFAULT_MAX_CHARS} characters is cut in the middle, keeping its start and end, and the result's first line says so (add "max_chars": N, at most ${MAX_MAX_CHARS}, to see more). Timeout ${CMD_TIMEOUT_S} s.
+- {"type": "read_file", "path": "...", "start_line": N, "end_line": M}: show lines N to M of a file, numbered (both optional: the whole file, or from N to the end). It shows exactly the lines asked for and is never cut in the middle; a range over ${READ_MAX_CHARS} characters stops early and says where to go on. Use it, not cat or sed, to read files.
 - {"type": "write_file", "path": "...", "content": "..."}: create or overwrite a file. Relative paths are under your working directory.
 - {"type": "edit_file", "path": "...", "old": "...", "new": "..."}: replace text that occurs exactly once in the file.
 - {"type": "ask", "question": "..."}: ask the maintainers something the docs and code don't tell you. No one will answer during this test; the question is recorded as feedback on the docs.
@@ -56,6 +60,7 @@ export const RESPONSE_SCHEMA = obj({
   action: {
     anyOf: [
       obj({ type: actionType("run"), cmd: str, max_chars: { type: "integer" } }, ["type", "cmd"]),
+      obj({ type: actionType("read_file"), path: str, start_line: { type: "integer" }, end_line: { type: "integer" } }, ["type", "path"]),
       obj({ type: actionType("write_file"), path: str, content: str }, ["type", "path", "content"]),
       obj({ type: actionType("edit_file"), path: str, old: str, new: str }, ["type", "path", "old", "new"]),
       obj({ type: actionType("ask"), question: str }, ["type", "question"]),
@@ -162,6 +167,12 @@ export function validateAction(a: Action): string | null {
       if (!str("cmd")) return 'run needs "cmd" (string)';
       if (a.max_chars !== undefined && typeof a.max_chars !== "number") return '"max_chars" must be a number';
       return null;
+    case "read_file":
+      if (!str("path")) return 'read_file needs "path" (string)';
+      for (const k of ["start_line", "end_line"]) {
+        if (a[k] !== undefined && !(Number.isInteger(a[k]) && (a[k] as number) >= 1)) return `"${k}" must be a whole number, at least 1`;
+      }
+      return null;
     case "write_file":
       return str("path") && str("content") ? null : 'write_file needs "path" and "content" (strings)';
     case "edit_file":
@@ -182,6 +193,8 @@ export function describeAction(a: Action): string {
   switch (a.type) {
     case "run":
       return a.max_chars !== undefined && a.max_chars !== DEFAULT_MAX_CHARS ? `run (max_chars ${a.max_chars}): ${a.cmd}` : `run: ${a.cmd}`;
+    case "read_file":
+      return `read_file: ${a.path}${a.start_line !== undefined || a.end_line !== undefined ? ` (lines ${a.start_line ?? 1}-${a.end_line ?? "end"})` : ""}`;
     case "write_file":
     case "edit_file":
       return `${a.type}: ${a.path}`;

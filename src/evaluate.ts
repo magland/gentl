@@ -68,6 +68,8 @@ function formatActionForEvaluator(a: any): string {
   switch (a.type) {
     case "run":
       return `run:\n${fence(String(a.cmd), "bash")}`;
+    case "read_file":
+      return `read_file ${a.path}${a.start_line !== undefined || a.end_line !== undefined ? ` lines ${a.start_line ?? 1}-${a.end_line ?? "end"}` : ""}`;
     case "write_file":
       return `write_file ${a.path}:\n${fence(clip(String(a.content), RESULT_CAP))}`;
     case "edit_file":
