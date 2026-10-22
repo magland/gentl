@@ -206,6 +206,30 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     ? new DockerSandbox(`gentl-${runId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}-${randomBytes(3).toString("hex")}`, opts.sandbox.image,
       lc ? [{ host: lc.mirrorDir, container: MIRROR_MOUNT }] : [])
     : new HostSandbox();
+  // Signal handlers go in as soon as the sandbox exists, so no signal can leave it behind.
+  // Ctrl-C stops the running command, or cancels the model call and ends the run.
+  // SIGTERM and SIGHUP end the run wherever it is; the run directory is still completed.
+  // During cleanup further signals are ignored, so a second Ctrl-C cannot leave the sandbox behind.
+  let abortModel: AbortController | null = null;
+  let stopRequested = false;
+  let cleaningUp = false;
+  const onSigint = () => {
+    if (cleaningUp) return console.log("     still cleaning up (removing the sandbox); please wait");
+    if (sb.interrupt()) return;
+    stopRequested = true;
+    abortModel?.abort();
+  };
+  const onTerm = () => {
+    if (cleaningUp) return;
+    stopRequested = true;
+    sb.interrupt();
+    abortModel?.abort();
+    activePrompt?.close();
+  };
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onTerm);
+  process.on("SIGHUP", onTerm);
+
   const localCopyError = lc
     ? configureLocalCopy(sb, lc, sb.kind === "docker" ? `${MIRROR_MOUNT}/${lc.mirrorName}` : path.join(lc.mirrorDir, lc.mirrorName))
     : null;
@@ -255,23 +279,6 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   emit({ type: "start", run_id: runId, task: opts.task, task_source: opts.taskSource, model: opts.model.model,
     backend: opts.model.backend, base_url: s.base_url, sandbox: sb.kind, sandbox_description: sb.describe(), workdir: sb.workdir, confirm: opts.confirm, system_prompt: system });
 
-  // Ctrl-C stops the running command, or cancels the model call and ends the run.
-  // SIGTERM and SIGHUP end the run wherever it is; the run directory is still completed.
-  let abortModel: AbortController | null = null;
-  let stopRequested = false;
-  const onSigint = () => {
-    if (sb.interrupt()) return;
-    if (abortModel) abortModel.abort();
-  };
-  const onTerm = () => {
-    stopRequested = true;
-    sb.interrupt();
-    abortModel?.abort();
-    activePrompt?.close();
-  };
-  process.on("SIGINT", onSigint);
-  process.on("SIGTERM", onTerm);
-  process.on("SIGHUP", onTerm);
 
   let notes = "";
   let last: { action: string; result: string } | null = null;
@@ -412,9 +419,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
       s.error = (e as Error).message;
     }
   } finally {
-    process.off("SIGINT", onSigint);
-    process.off("SIGTERM", onTerm);
-    process.off("SIGHUP", onTerm);
+    cleaningUp = true;
     const ended = new Date();
     s.ended = ended.toISOString();
     s.duration_s = (ended.getTime() - started.getTime()) / 1000;
@@ -433,6 +438,9 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     if (!opts.keep) sb.remove();
     else if (sb instanceof DockerSandbox) console.log(`\ncontainer kept: ${sb.name} (remove with: docker rm -f ${sb.name})`);
     else if (sb instanceof HostSandbox) console.log(`\nworkspace kept: ${sb.root}`);
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onTerm);
+    process.off("SIGHUP", onTerm);
   }
   console.log(`\n${formatSummary(s)}`);
   if (s.self_report_summary) console.log(`Agent's summary: ${s.self_report_summary}\n`);
