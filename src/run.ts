@@ -9,7 +9,7 @@ import { evaluateRun, type Evaluation } from "./evaluate.js";
 import { describeFinalState, type RepoState } from "./finalstate.js";
 import { uploadRun, type HubCredentials } from "./hub.js";
 import { configureLocalCopy, describeLocalCopy, localCopyInfo, prefixCollisions, type LocalCopy } from "./localcopy.js";
-import { applyNotes, ASK_RESULT, describeAction, hasNotesDecision, NOTES_REMINDER, parseResponse, RESPONSE_SCHEMA, systemPrompt, validateAction,
+import { applyNotes, ASK_RESULT, describeAction, hasNotesDecision, namedAiFile, NOTES_REMINDER, withoutTaskLines, parseResponse, RESPONSE_SCHEMA, systemPrompt, validateAction,
   type Action } from "./protocol.js";
 import { fence } from "./format.js";
 import { ntok } from "./tokens.js";
@@ -75,6 +75,8 @@ export interface Summary {
   declined_actions: number;
   notes_reminders: number;
   notes_shrink_warnings: number;
+  notes_task_lines: number; // turns whose updated notes had a Task/Goal line, removed
+  ai_file_refusals: number; // actions refused for naming a file written for AI agents
   asks: { turn: number; question: string }[];
   // aborted: the person running gentl pressed Ctrl-C (evaluated as a failure, and uploaded);
   // interrupted: SIGTERM or SIGHUP (not evaluated or uploaded).
@@ -123,6 +125,7 @@ function formatSummary(s: Summary): string {
     ["Questions asked", s.asks.length],
     ["Notes reminders (responses without a notes decision)", s.notes_reminders],
     ["Notes shrink warnings (a rewrite lost over half the notes)", s.notes_shrink_warnings],
+    ["Task/Goal lines removed from notes / refused AI-agent file reads", `${s.notes_task_lines} / ${s.ai_file_refusals}`],
     ["Cost", `$${s.cost_usd.toFixed(4)}${s.backend === "claude-code" ? " (notional; Claude Code subscription)" : ""}`],
     ["Duration", `${Math.round(s.duration_s)} s`],
   ];
@@ -272,7 +275,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     system_prompt: system, overhead_tokens: ntok(system) + ntok(opts.task), turns: 0,
     read_tokens_total: 0, notes_tokens_total: 0, notes_tokens_max: 0, result_tokens_total: 0, result_tokens_max: 0,
     model_output_tokens: 0, provider_prompt_tokens: 0, provider_completion_tokens: 0, cost_usd: 0,
-    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0, notes_reminders: 0, notes_shrink_warnings: 0, asks: [],
+    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0, notes_reminders: 0, notes_shrink_warnings: 0, notes_task_lines: 0, ai_file_refusals: 0, asks: [],
     stop_reason: null, error: null, finished: false,
     self_reported_success: null, self_report_summary: null, self_report_friction: null, final_repos: null,
   };
@@ -301,7 +304,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
   try {
     for (let turn = 1; turn <= opts.maxTurns; turn++) {
       if (stopRequested || abortRequested) throw new Interrupted();
-      let user = `# Task\n${opts.task}\n\n# Your notes\n${notes || "(empty)"}\n`;
+      let user = `# Task (shown every turn; don't copy it into your notes)\n${opts.task}\n\n# Your notes\n${notes || "(empty)"}\n`;
       if (last) user += `\n# Last action\n${last.action}\n\n# Result\n${last.result}\n`;
       const notesTok = ntok(notes);
       let resultTok = last ? ntok(last.action) + ntok(last.result) : 0;
@@ -372,9 +375,17 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
       const notesBefore = notesTok;
       const n = applyNotes(notes, parsed);
       notes = n.notes;
+      const notesAfter = ntok(notes);
+      // A Task or Goal line only restates the task, which the agent sees every turn. Prompting against it did not
+      // stop models from writing one, so it is removed; the agent is told the first time.
+      const stripped = withoutTaskLines(notes);
+      if (stripped.removed) {
+        notes = stripped.notes;
+        if (!s.notes_task_lines) n.feedback.push("note: the Task/Goal line was removed from your notes, since the task is shown to you every turn; such lines will be removed from now on.");
+        s.notes_task_lines++;
+      }
       // A rewrite that loses much of the notes is pointed out on the next turn: details dropped in a careless
       // rewrite are the commonest reason an agent redoes work.
-      const notesAfter = ntok(notes);
       if (n.ops.includes("rewritten") && notesBefore >= 100 && notesAfter < notesBefore / 2) {
         s.notes_shrink_warnings++;
         n.feedback.push(`note: your notes went from ${notesBefore} to ${notesAfter} tokens with this rewrite; check that nothing you still need was lost (grow the notes with notes_append and notes_edit rather than rewriting them).`);
@@ -411,6 +422,9 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
       if (invalid) {
         s.invalid_actions++;
         full = shown = `error: malformed action: ${invalid}`;
+      } else if (namedAiFile(a)) {
+        s.ai_file_refusals++;
+        full = shown = `error: not run: it names ${namedAiFile(a)}, a file written for AI agents. This test follows a human newcomer; use what a person would read (README, docs, CONTRIBUTING, the code).`;
       } else if (a.type === "ask") {
         s.asks.push({ turn, question: String(a.question) });
         full = shown = ASK_RESULT;

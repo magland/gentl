@@ -21,7 +21,7 @@ export const CMD_TIMEOUT_S = 300;
 export function systemPrompt(workdir: string, platform: string): string {
   return `You are a newcomer to some software, carrying out a task on a ${platform} machine with internet access. Your working directory is ${workdir}; it starts empty. Tools include git, curl and w3m (\`w3m -dump URL\` renders a web page as plain text).
 
-Treat the software as unfamiliar. Go by its docs and code, not by what you remember about it, since the version here may differ.
+Treat the software as unfamiliar. Go by its docs and code, not by what you remember about it, since the version here may differ. Don't read files written for AI agents (CLAUDE.md, AGENTS.md, GEMINI.md, .cursorrules, .cursor/rules, copilot-instructions.md and the like): this test follows a human newcomer, so use what a person would read (README, docs, CONTRIBUTING, the code). Commands that name such files are refused.
 
 This is a test of how readable the software and its docs are. We count the tokens of the results you read as a proxy for the effort a human newcomer would need, and we collect what was missing or unclear. So read in a targeted way (grep, sed -n, head, --help) rather than dumping whole files or long pages. When the docs and code don't answer something you need, don't keep searching or guess silently: use the ask action, then make a reasonable decision and move on. A gap in the docs is useful feedback, not a failure on your part.
 
@@ -34,8 +34,7 @@ Be generous with notes. Forgetting is what costs: an agent with thin notes rerea
 - what you have read and what it told you: file and line range or doc section, the key facts, and any exact snippets you will need again (a function signature, the lines you will edit);
 - commands that worked, written out exactly, with the key part of their output; commands that failed, and why;
 - your plan and the next step.
-A layout that stays the same from turn to turn makes this easy, with new lines appended under each heading:
-Goal: ...
+The task is shown to you every turn, above your notes, so your notes must not repeat or restate it (no Task or Goal line); record only your own decisions about it (such as which approach you chose) under Plan. A layout that stays the same from turn to turn makes this easy, with new lines appended under each heading:
 Done: (each step and its outcome)
 Learned: (file:lines and what they say; exact snippets)
 Commands: (exact commands that worked, with key output; failures and why)
@@ -170,6 +169,25 @@ export function applyNotes(notes: string, r: AgentResponse): { notes: string; op
     } else feedback.push('"notes_append" must be a string; it was ignored.');
   }
   return { notes, ops, feedback };
+}
+
+/** Files written for AI coding agents, which a human newcomer would not use; actions that name them are refused. */
+export const AI_AGENT_FILES = /(^|[\s/'"=:(])(CLAUDE\.md|CLAUDE\.local\.md|AGENTS?\.md|GEMINI\.md|\.cursorrules|\.cursor\/rules|copilot-instructions\.md|\.windsurfrules|\.clinerules)(?=$|[\s'"/;|&)<>]|$)/i;
+
+/** The AI-agent file an action names, if any (read_file's path, or a run command). */
+export function namedAiFile(a: Action): string | null {
+  const text = a.type === "read_file" ? String(a.path) : a.type === "run" ? String(a.cmd) : null;
+  if (text === null) return null;
+  const m = text.match(AI_AGENT_FILES);
+  return m ? m[2] : null;
+}
+
+const TASK_LINE = /^\s*[-*]?\s*(task|goal)\s*:.*(\n|$)/gim;
+
+/** Notes without lines restating the task (the agent sees the task every turn), and whether any were removed. */
+export function withoutTaskLines(notes: string): { notes: string; removed: boolean } {
+  const out = notes.replace(TASK_LINE, "");
+  return { notes: out, removed: out !== notes };
 }
 
 /** Why the action is malformed, or null if it is fine. */

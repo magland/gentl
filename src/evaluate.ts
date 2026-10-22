@@ -24,6 +24,7 @@ Write two things.
 - Missing or wrong: what the agent needed but could not find in the docs, or found wrong or outdated. Be specific: which file or section, and what it should say.
 - Guesses: where the agent went ahead without support from the docs (inferred from config, CI files or code, or trial and error).
 - Prior knowledge: commands, APIs, flags or facts the agent used that never appeared in any result it saw before that point, so they came from its training and the docs were not tested there.
+- AI-agent files: any use of files written for AI agents (CLAUDE.md, AGENTS.md and the like), which a human newcomer would not read; gentl refuses actions that name them, but their content can still leak in through broad searches. Say what was taken from them, since the docs were not tested there.
 - Questions: each question the agent asked, and whether the docs answer it.
 Keep it short and concrete, as bullets; write "none" for an empty section. Separate problems in the software's docs from problems caused by the agent's own mistakes or by the test environment (for example a missing system package), and say which is which.
 
