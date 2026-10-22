@@ -126,7 +126,7 @@ The evaluator's tokens are not counted as reading effort. Reading effort should 
 
 ## Hub
 
-A hub ([gentl-hub](https://github.com/magland/gentl-hub)) holds tasks with titles, shows the command to run each, and collects uploaded runs. gentl contacts a hub only when given a hub task URL or asked to upload.
+A hub ([gentl-hub](https://github.com/magland/gentl-hub); the public one is https://gentl-hub.jeremy-magland.workers.dev) holds tasks with titles, shows the command to run each, and collects uploaded runs. gentl contacts a hub only when given a hub task URL or asked to upload.
 
 - `gentl run https://<hub>/tasks/<id>` fetches the task, prints its title and text, and asks before running it (`--yes` skips this). Hub tasks always clone the published repo, never a local copy, so uploaded results match public code.
 - `--upload` uploads each run that finished (or hit the turn limit) to that hub; `gentl upload runs/<id>` uploads one later, and `gentl upload runs/<batch>` uploads every run in a batch. A run goes only to the hub its task came from.
