@@ -28,6 +28,14 @@ export function checkDocker() {
   if (!r.ok) throw new Error(`Docker is not available (${r.out.trim().split("\n")[0]}). Install or start Docker, or use --host.`);
 }
 
+/** Messages from the docker client and setsid (the command's own stderr is merged into stdout in the container).
+ * setsid's note about a child killed by a signal is dropped; a missing or stopped container is fatal. */
+function classifyDockerStderr(text: string): { keep: string; fatal: string | null } {
+  const lines = text.split("\n").filter((l) => l.trim() && !/^setsid: child \d+ did not exit normally/.test(l));
+  const fatal = lines.find((l) => /No such container|is not running|Cannot connect to the Docker daemon/i.test(l)) ?? null;
+  return { keep: lines.length ? lines.join("\n") + "\n" : "", fatal };
+}
+
 export class DockerSandbox extends Sandbox {
   readonly kind = "docker";
   readonly workdir = WORKDIR;
@@ -58,7 +66,7 @@ export class DockerSandbox extends Sandbox {
       docker(["exec", this.name, "bash", "-c", `kill -9 -- -$(cat ${pidFile}) 2>/dev/null`]);
       setTimeout(() => child.kill("SIGKILL"), 2000).unref();
     };
-    return { child, kill, ignoreStderr: true };
+    return { child, kill, sandboxStderr: classifyDockerStderr };
   }
 
   exec(args: string[], cwd?: string, input?: string): ExecResult {

@@ -396,6 +396,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
           ev.declined = reason;
         } else if (a.type === "run") {
           const r = await sb.run(String(a.cmd), a.max_chars as number | undefined);
+          if (r.sandboxError) throw new Error(`the sandbox failed: ${r.sandboxError.trim()}`);
           ({ full, shown } = r);
           Object.assign(ev, { truncation: r.truncation ?? undefined, exit_code: r.exitCode, signal: r.signal, cmd_seconds: r.seconds, timed_out: r.timedOut,
             interrupted: r.interrupted });

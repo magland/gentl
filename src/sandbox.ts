@@ -16,6 +16,7 @@ export interface RunResult {
   seconds: number;
   timedOut: boolean;
   interrupted: boolean;
+  sandboxError: string | null; // the sandbox failed (e.g. its container disappeared); the run cannot go on
 }
 
 export interface ExecResult {
@@ -66,7 +67,9 @@ class Capture {
 export interface Started {
   child: ChildProcess;
   kill: () => void;
-  ignoreStderr?: boolean; // the command's stderr already arrives on stdout
+  /** The command's own stderr arrives on stdout; stderr carries only the sandbox's messages (e.g. docker's).
+   * This classifies them: lines to drop, and a fatal error meaning the sandbox itself is gone. */
+  sandboxStderr?: (text: string) => { keep: string; fatal: string | null };
 }
 
 export abstract class Sandbox {
@@ -93,8 +96,10 @@ export abstract class Sandbox {
     this.current = cur;
     const cap = new Capture();
     child.stdout!.on("data", (b: Buffer) => cap.add(b));
+    let sandboxStderr = "";
     child.stderr!.on("data", (b: Buffer) => {
-      if (!started.ignoreStderr) cap.add(b);
+      if (started.sandboxStderr) sandboxStderr += b.toString("utf8");
+      else cap.add(b);
     });
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -109,13 +114,16 @@ export abstract class Sandbox {
         done = true;
         clearTimeout(timer);
         this.current = null;
+        const classified = started.sandboxStderr?.(sandboxStderr) ?? { keep: "", fatal: null };
+        if (classified.keep) cap.add(Buffer.from(classified.keep));
         const out = cap.text();
         const status = cur.interrupted ? "stopped by the person running gentl (Ctrl-C)"
           : timedOut ? `timed out after ${CMD_TIMEOUT_S} s` : code !== null ? `exit code ${code}` : `killed by ${signal}`;
         const truncation = out.length > maxChars
           ? { head: status.length + 1 + Math.floor((maxChars * 3) / 5), tail: Math.floor((maxChars * 2) / 5) } : null;
         resolve({ exitCode: code, signal, full: `${status}\n${out}`, shown: `${status}\n${truncate(out, maxChars)}`,
-          truncation, seconds: (Date.now() - t0) / 1000, timedOut, interrupted: cur.interrupted });
+          truncation, seconds: (Date.now() - t0) / 1000, timedOut, interrupted: cur.interrupted,
+          sandboxError: classified.fatal });
       };
       child.on("error", (e) => {
         cap.add(Buffer.from(`error: ${e.message}\n`));
