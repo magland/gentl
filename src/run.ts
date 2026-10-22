@@ -74,6 +74,7 @@ export interface Summary {
   repeated_actions: number;
   declined_actions: number;
   notes_reminders: number;
+  notes_shrink_warnings: number;
   asks: { turn: number; question: string }[];
   // aborted: the person running gentl pressed Ctrl-C (evaluated as a failure, and uploaded);
   // interrupted: SIGTERM or SIGHUP (not evaluated or uploaded).
@@ -121,6 +122,7 @@ function formatSummary(s: Summary): string {
       `${s.parse_errors} / ${s.invalid_actions} / ${s.repeated_actions} / ${s.declined_actions}`],
     ["Questions asked", s.asks.length],
     ["Notes reminders (responses without a notes decision)", s.notes_reminders],
+    ["Notes shrink warnings (a rewrite lost over half the notes)", s.notes_shrink_warnings],
     ["Cost", `$${s.cost_usd.toFixed(4)}${s.backend === "claude-code" ? " (notional; Claude Code subscription)" : ""}`],
     ["Duration", `${Math.round(s.duration_s)} s`],
   ];
@@ -270,7 +272,7 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
     system_prompt: system, overhead_tokens: ntok(system) + ntok(opts.task), turns: 0,
     read_tokens_total: 0, notes_tokens_total: 0, notes_tokens_max: 0, result_tokens_total: 0, result_tokens_max: 0,
     model_output_tokens: 0, provider_prompt_tokens: 0, provider_completion_tokens: 0, cost_usd: 0,
-    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0, notes_reminders: 0, asks: [],
+    parse_errors: 0, invalid_actions: 0, repeated_actions: 0, declined_actions: 0, notes_reminders: 0, notes_shrink_warnings: 0, asks: [],
     stop_reason: null, error: null, finished: false,
     self_reported_success: null, self_report_summary: null, self_report_friction: null, final_repos: null,
   };
@@ -367,8 +369,16 @@ export async function runTask(opts: RunOptions): Promise<RunOutcome> {
         continue;
       }
 
+      const notesBefore = notesTok;
       const n = applyNotes(notes, parsed);
       notes = n.notes;
+      // A rewrite that loses much of the notes is pointed out on the next turn: details dropped in a careless
+      // rewrite are the commonest reason an agent redoes work.
+      const notesAfter = ntok(notes);
+      if (n.ops.includes("rewritten") && notesBefore >= 100 && notesAfter < notesBefore / 2) {
+        s.notes_shrink_warnings++;
+        n.feedback.push(`note: your notes went from ${notesBefore} to ${notesAfter} tokens with this rewrite; check that nothing you still need was lost (grow the notes with notes_append and notes_edit rather than rewriting them).`);
+      }
       const a = parsed.action;
       const line = actionLine(a);
       console.log(prefix + line);
