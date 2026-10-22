@@ -38,7 +38,7 @@ options:
                       claude-code (your Claude Code login, via claude -p); default from
                       GENTL_BACKEND, else openrouter
   --base-url URL      OpenAI-compatible endpoint (default ${DEFAULT_BASE_URL})
-  --max-turns N       stop after N turns (default 50)
+  --max-turns N       stop after N turns (default 250)
   --repeat N          run each task N times and report the success rate and median read tokens
   --local             serve clones of the task's repo from your checkout, uncommitted changes included
                       (the default when the task file, suite or current directory is in a git repo)
@@ -81,7 +81,7 @@ async function run(argv: string[]) {
       "evaluator-model": { type: "string", default: DEFAULT_MODEL },
       backend: { type: "string" },
       "base-url": { type: "string", default: DEFAULT_BASE_URL },
-      "max-turns": { type: "string", default: "50" },
+      "max-turns": { type: "string", default: "250" },
       repeat: { type: "string", default: "1" },
       keep: { type: "boolean" },
       help: { type: "boolean", short: "h" },

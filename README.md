@@ -42,7 +42,7 @@ Options:
 - `--backend B`: `openrouter` (default) or `claude-code`; see Backends.
 - `--local` / `--remote`: serve clones of the task's repo from your checkout (the default inside a git repo), or clone the published repo; see Local copy.
 - `--base-url URL`: any OpenAI-compatible endpoint (default `https://openrouter.ai/api/v1`). The key in `OPENROUTER_API_KEY` is sent to it.
-- `--max-turns N`: default 50.
+- `--max-turns N`: default 250.
 - `--repeat N`: run each task N times; see Repeated runs.
 - `--keep`: keep the container or temp workspace instead of deleting it.
 
